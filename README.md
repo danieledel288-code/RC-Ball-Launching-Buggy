@@ -8,7 +8,6 @@ An ESP32 hosts its own WiFi access point, so a phone can connect and control the
 
 - **`flywheel_control/flywheel_control.ino`** - Main control sketch. Hosts a WiFi access point and a web control page (arm/stop, independent speed sliders for each flywheel motor, gate open/close). Includes a heartbeat watchdog that stops the motors if the connection to the phone is lost.
 - **`esc_calibration/esc_calibration.ino`** - Standalone sketch for calibrating the flywheel ESCs' throttle range through the PCA9685, step-paced over Serial Monitor rather than on a timer.
-- **`esc_test.py`** - Early bench-test script (Raspberry Pi / gpiozero), superseded by the ESP32 sketches above.
 
 ## Hardware
 
@@ -32,4 +31,4 @@ An ESP32 hosts its own WiFi access point, so a phone can connect and control the
 
 ## Media
 
-Build photos, timelapses, and test videos live in [`media/`](media/).
+View photos, timelapses, and test videos in [`media/`](media/).

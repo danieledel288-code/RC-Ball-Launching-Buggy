@@ -1,3 +1,3 @@
 # Media
 
-Drop build photos, timelapses, and test videos here.
+View photos, timelapses, and test videos here.
