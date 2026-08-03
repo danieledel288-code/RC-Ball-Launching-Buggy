@@ -1,0 +1,241 @@
+#include <WiFi.h>
+#include <WebServer.h>
+#include <Wire.h>
+#include <Adafruit_PWMServoDriver.h>
+
+const char* ap_ssid = "PickleballLauncher";
+const char* ap_password = "launch123";  // min 8 chars, needed for WPA2
+
+Adafruit_PWMServoDriver pwm = Adafruit_PWMServoDriver(0x40);
+
+const int CH_SERVO = 1;
+const int CH_RIGHT = 0;
+const int CH_LEFT  = 2;
+
+const int MIN_US = 1000;   // ESC minimum throttle / arm signal
+const int MAX_US = 2000;   // ESC full throttle
+
+const int SERVO_MIN_US = 1000;  // servo's 0 degree pulse - tune once gate is mounted
+const int SERVO_MAX_US = 2000;  // servo's 180 degree pulse - tune once gate is mounted
+const int GATE_CLOSED_ANGLE = 20;   // placeholder - adjust after physical test
+const int GATE_OPEN_ANGLE   = 160;  // placeholder - adjust after physical test
+
+WebServer server(80);
+bool armed = false;
+unsigned long lastHeartbeat = 0;
+const unsigned long HEARTBEAT_TIMEOUT = 20000; // stop motors if no heartbeat for 20s
+
+void setPulse(int channel, int us) {
+  pwm.writeMicroseconds(channel, us);
+}
+
+void setServoAngle(int channel, int angle) {
+  int us = map(angle, 0, 180, SERVO_MIN_US, SERVO_MAX_US);
+  pwm.writeMicroseconds(channel, us);
+}
+
+const char* PAGE_HTML = R"rawliteral(
+<!DOCTYPE html>
+<html>
+<head>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Launcher Control</title>
+<style>
+  * { box-sizing: border-box; }
+  body {
+    font-family: -apple-system, system-ui, sans-serif;
+    background: #111; color: #eee;
+    text-align: center; padding: 24px 16px; margin: 0;
+  }
+  h2 { font-weight: 600; margin-bottom: 4px; }
+  .status {
+    display: inline-block; padding: 6px 16px; border-radius: 20px;
+    font-weight: 600; font-size: 14px; margin-bottom: 24px;
+  }
+  .armed { background: #1a3; color: #fff; }
+  .disarmed { background: #444; color: #aaa; }
+  .card {
+    background: #1c1c1c; border-radius: 16px; padding: 20px;
+    margin: 0 auto 16px; max-width: 400px;
+  }
+  .card h3 { margin: 0 0 12px; font-size: 16px; color: #aaa; font-weight: 500; }
+  .pct { font-size: 32px; font-weight: 700; margin-bottom: 12px; }
+  input[type=range] { width: 100%; height: 40px; -webkit-appearance: none; background: transparent; }
+  input[type=range]::-webkit-slider-runnable-track { height: 8px; background: #333; border-radius: 4px; }
+  input[type=range]::-webkit-slider-thumb {
+    -webkit-appearance: none; width: 32px; height: 32px; border-radius: 50%;
+    background: #4af; margin-top: -12px; box-shadow: 0 2px 6px rgba(0,0,0,0.4);
+  }
+  input[type=range]:disabled::-webkit-slider-thumb { background: #555; }
+  .btnrow { max-width: 400px; margin: 0 auto 16px; display: flex; gap: 12px; }
+  button { flex: 1; padding: 18px; font-size: 18px; font-weight: 700; border: none; border-radius: 12px; cursor: pointer; }
+  #armBtn { background: #4af; color: #fff; }
+  #stopBtn { background: #e33; color: #fff; }
+  .gateBtn { background: #666; color: #fff; }
+  button:active { opacity: 0.8; }
+  button:disabled { background: #333; color: #777; }
+</style>
+</head>
+<body>
+  <h2>Launcher Control</h2>
+  <div id="statusBadge" class="status disarmed">NOT ARMED</div>
+
+  <div class="card">
+    <h3>Right Motor</h3>
+    <div class="pct" id="pctR">0%</div>
+    <input type="range" id="sliderR" min="0" max="100" value="0" disabled>
+  </div>
+
+  <div class="card">
+    <h3>Left Motor</h3>
+    <div class="pct" id="pctL">0%</div>
+    <input type="range" id="sliderL" min="0" max="100" value="0" disabled>
+  </div>
+
+  <div class="btnrow">
+    <button id="armBtn" onclick="arm()">ARM</button>
+    <button id="stopBtn" onclick="stopAll()">STOP</button>
+  </div>
+
+  <div class="btnrow">
+    <button class="gateBtn" onclick="gateOpen()">Open Gate</button>
+    <button class="gateBtn" onclick="gateClose()">Close Gate</button>
+  </div>
+
+<script>
+let heartbeatTimer = null;
+function startHeartbeat() {
+  if (heartbeatTimer) return;
+  heartbeatTimer = setInterval(() => fetch('/heartbeat'), 2000);
+}
+function stopHeartbeat() {
+  clearInterval(heartbeatTimer);
+  heartbeatTimer = null;
+}
+function setArmedUI(isArmed) {
+  document.getElementById('statusBadge').textContent = isArmed ? 'ARMED' : 'NOT ARMED';
+  document.getElementById('statusBadge').className = 'status ' + (isArmed ? 'armed' : 'disarmed');
+  document.getElementById('sliderR').disabled = !isArmed;
+  document.getElementById('sliderL').disabled = !isArmed;
+  if (!isArmed) {
+    document.getElementById('sliderR').value = 0;
+    document.getElementById('sliderL').value = 0;
+    document.getElementById('pctR').textContent = '0%';
+    document.getElementById('pctL').textContent = '0%';
+    stopHeartbeat();
+  } else {
+    startHeartbeat();
+  }
+}
+function arm() { fetch('/arm').then(() => setArmedUI(true)); }
+function stopAll() { fetch('/stop').then(() => setArmedUI(false)); }
+function gateOpen() { fetch('/gateopen'); }
+function gateClose() { fetch('/gateclose'); }
+function sendSpeed() {
+  const r = document.getElementById('sliderR').value;
+  const l = document.getElementById('sliderL').value;
+  fetch(`/speed?right=${r}&left=${l}`).then(res => {
+    if (res.status === 403) {
+      alert('Disarmed by the ESP32 (heartbeat timeout) - hit ARM again.');
+      setArmedUI(false);
+    }
+  });
+}
+const sR = document.getElementById('sliderR');
+const sL = document.getElementById('sliderL');
+sR.addEventListener('input', () => document.getElementById('pctR').textContent = sR.value + '%');
+sL.addEventListener('input', () => document.getElementById('pctL').textContent = sL.value + '%');
+sR.addEventListener('change', sendSpeed);
+sL.addEventListener('change', sendSpeed);
+</script>
+</body>
+</html>
+)rawliteral";
+
+void handleRoot() {
+  server.send(200, "text/html", PAGE_HTML);
+}
+
+void handleArm() {
+  setPulse(CH_RIGHT, MIN_US);
+  setPulse(CH_LEFT, MIN_US);
+  armed = true;
+  lastHeartbeat = millis();
+  server.send(200, "text/plain", "armed");
+}
+
+void handleSpeed() {
+  if (!armed) {
+    server.send(403, "text/plain", "not armed");
+    return;
+  }
+  if (server.hasArg("right")) {
+    int pct = constrain(server.arg("right").toInt(), 0, 100);
+    setPulse(CH_RIGHT, map(pct, 0, 100, MIN_US, MAX_US));
+  }
+  if (server.hasArg("left")) {
+    int pct = constrain(server.arg("left").toInt(), 0, 100);
+    setPulse(CH_LEFT, map(pct, 0, 100, MIN_US, MAX_US));
+  }
+  server.send(200, "text/plain", "ok");
+}
+
+void handleStop() {
+  setPulse(CH_RIGHT, MIN_US);
+  setPulse(CH_LEFT, MIN_US);
+  armed = false;
+  server.send(200, "text/plain", "stopped");
+}
+
+void handleGateOpen() {
+  setServoAngle(CH_SERVO, GATE_OPEN_ANGLE);
+  server.send(200, "text/plain", "gate open");
+}
+
+void handleGateClose() {
+  setServoAngle(CH_SERVO, GATE_CLOSED_ANGLE);
+  server.send(200, "text/plain", "gate closed");
+}
+
+void handleHeartbeat() {
+  lastHeartbeat = millis();
+  server.send(200, "text/plain", "ok");
+}
+
+void setup() {
+  Serial.begin(115200);
+
+  Wire.begin(21, 22); // SDA, SCL - default ESP32 I2C pins
+  pwm.begin();
+  pwm.setPWMFreq(50); // standard RC/servo frequency
+
+  setPulse(CH_RIGHT, MIN_US);
+  setPulse(CH_LEFT, MIN_US);
+  setServoAngle(CH_SERVO, GATE_CLOSED_ANGLE);
+
+  WiFi.softAP(ap_ssid, ap_password);
+  Serial.print("Access point started. Connect your phone to WiFi \"");
+  Serial.print(ap_ssid);
+  Serial.println("\"");
+  Serial.print("Then browse to: http://");
+  Serial.println(WiFi.softAPIP());
+
+  server.on("/", handleRoot);
+  server.on("/arm", handleArm);
+  server.on("/speed", handleSpeed);
+  server.on("/stop", handleStop);
+  server.on("/gateopen", handleGateOpen);
+  server.on("/gateclose", handleGateClose);
+  server.on("/heartbeat", handleHeartbeat);
+  server.begin();
+}
+
+void loop() {
+  if (armed && millis() - lastHeartbeat > HEARTBEAT_TIMEOUT) {
+    Serial.println("Heartbeat lost - stopping motors");
+    setPulse(CH_RIGHT, MIN_US);
+    setPulse(CH_LEFT, MIN_US);
+    armed = false;
+  }
+  server.handleClient();
+}
