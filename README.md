@@ -1,6 +1,6 @@
 # RC Ball-Launching Buggy
 
-Control code for an autonomous pickleball launcher built on a gutted toy car chassis, entered in the Blueprint.am Summer Build Contest.
+Control code for an autonomous pickleball launcher built on a gutted toy car chassis, entered in the Blueprint.io Summer Build Contest.
 
 An ESP32 hosts its own WiFi access point, so a phone can connect and control the launcher directly with no home router or internet connection needed. Two flywheel ESCs and a gate servo are driven through a PCA9685 PWM board over I2C.
 
@@ -29,3 +29,7 @@ An ESP32 hosts its own WiFi access point, so a phone can connect and control the
 2. Flash `flywheel_control.ino`. On boot it prints its access point name and IP address to Serial Monitor (115200 baud).
 3. Connect a phone to the ESP32's WiFi network and open the printed IP address in a browser.
 4. Arm, then use the sliders to test each flywheel independently before combining them.
+
+## Media
+
+Build photos, timelapses, and test videos live in [`media/`](media/).
