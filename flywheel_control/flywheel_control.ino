@@ -11,14 +11,21 @@ Adafruit_PWMServoDriver pwm = Adafruit_PWMServoDriver(0x40);
 const int CH_SERVO = 1;
 const int CH_RIGHT = 0;
 const int CH_LEFT  = 2;
+const int CH_DRIVE = 3;   // QuicRun 1060, drives both drive motors in parallel
 
-const int MIN_US = 1000;   // ESC minimum throttle / arm signal
-const int MAX_US = 2000;   // ESC full throttle
+const int MIN_US = 1000;   // flywheel ESC minimum throttle / arm signal
+const int MAX_US = 2000;   // flywheel ESC full throttle
 
 const int SERVO_MIN_US = 1000;  // servo's 0 degree pulse - tune once gate is mounted
 const int SERVO_MAX_US = 2000;  // servo's 180 degree pulse - tune once gate is mounted
 const int GATE_CLOSED_ANGLE = 20;   // placeholder - adjust after physical test
 const int GATE_OPEN_ANGLE   = 160;  // placeholder - adjust after physical test
+
+// QuicRun 1060 is a bidirectional car ESC - neutral is 1500us, NOT 1000us like the
+// flywheel ESCs. Arming means holding neutral, not minimum.
+const int DRIVE_NEUTRAL_US = 1500;
+const int DRIVE_FORWARD_US = 1650;  // conservative starting point, partial throttle - raise gradually after testing
+const unsigned long DRIVE_BURST_MS = 2000;
 
 WebServer server(80);
 bool armed = false;
@@ -102,6 +109,10 @@ const char* PAGE_HTML = R"rawliteral(
     <button class="gateBtn" onclick="gateClose()">Close Gate</button>
   </div>
 
+  <div class="btnrow">
+    <button class="gateBtn" onclick="driveBurst()" style="background:#a33">Drive Burst (2s)</button>
+  </div>
+
 <script>
 let heartbeatTimer = null;
 function startHeartbeat() {
@@ -131,6 +142,10 @@ function arm() { fetch('/arm').then(() => setArmedUI(true)); }
 function stopAll() { fetch('/stop').then(() => setArmedUI(false)); }
 function gateOpen() { fetch('/gateopen'); }
 function gateClose() { fetch('/gateclose'); }
+function driveBurst() {
+  if (!confirm('Buggy will drive forward for 2 seconds. Clear path?')) return;
+  fetch('/driveburst');
+}
 function sendSpeed() {
   const r = document.getElementById('sliderR').value;
   const l = document.getElementById('sliderL').value;
@@ -159,6 +174,7 @@ void handleRoot() {
 void handleArm() {
   setPulse(CH_RIGHT, MIN_US);
   setPulse(CH_LEFT, MIN_US);
+  setPulse(CH_DRIVE, DRIVE_NEUTRAL_US);
   armed = true;
   lastHeartbeat = millis();
   server.send(200, "text/plain", "armed");
@@ -183,8 +199,22 @@ void handleSpeed() {
 void handleStop() {
   setPulse(CH_RIGHT, MIN_US);
   setPulse(CH_LEFT, MIN_US);
+  setPulse(CH_DRIVE, DRIVE_NEUTRAL_US);
   armed = false;
   server.send(200, "text/plain", "stopped");
+}
+
+void handleDriveBurst() {
+  if (!armed) {
+    server.send(403, "text/plain", "not armed");
+    return;
+  }
+  Serial.println("Drive burst starting");
+  setPulse(CH_DRIVE, DRIVE_FORWARD_US);
+  delay(DRIVE_BURST_MS);
+  setPulse(CH_DRIVE, DRIVE_NEUTRAL_US);
+  Serial.println("Drive burst done, back to neutral");
+  server.send(200, "text/plain", "burst complete");
 }
 
 void handleGateOpen() {
@@ -211,6 +241,7 @@ void setup() {
 
   setPulse(CH_RIGHT, MIN_US);
   setPulse(CH_LEFT, MIN_US);
+  setPulse(CH_DRIVE, DRIVE_NEUTRAL_US);
   setServoAngle(CH_SERVO, GATE_CLOSED_ANGLE);
 
   WiFi.softAP(ap_ssid, ap_password);
@@ -226,6 +257,7 @@ void setup() {
   server.on("/stop", handleStop);
   server.on("/gateopen", handleGateOpen);
   server.on("/gateclose", handleGateClose);
+  server.on("/driveburst", handleDriveBurst);
   server.on("/heartbeat", handleHeartbeat);
   server.begin();
 }
