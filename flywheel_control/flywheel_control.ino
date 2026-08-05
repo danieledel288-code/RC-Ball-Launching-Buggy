@@ -8,9 +8,9 @@ const char* ap_password = "launch123";  // min 8 chars, needed for WPA2
 
 Adafruit_PWMServoDriver pwm = Adafruit_PWMServoDriver(0x40);
 
-const int CH_SERVO = 1;
-const int CH_RIGHT = 0;
-const int CH_LEFT  = 2;
+const int CH_SERVO = 0;
+const int CH_LEFT  = 1;
+const int CH_RIGHT = 2;
 const int CH_DRIVE = 3;   // QuicRun 1060, drives both drive motors in parallel
 
 const int MIN_US = 1000;   // flywheel ESC minimum throttle / arm signal
