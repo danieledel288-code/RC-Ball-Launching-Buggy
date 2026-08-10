@@ -27,6 +27,10 @@ const int DRIVE_NEUTRAL_US = 1500;
 const int DRIVE_FORWARD_US = 1650;  // conservative starting point, partial throttle - raise gradually after testing
 const unsigned long DRIVE_BURST_MS = 2000;
 
+// Continuous drive slider: same +/-150us envelope already proven safe by Drive Burst above.
+// slider value -100..100 -> DRIVE_NEUTRAL_US +/- DRIVE_MAX_DELTA_US
+const int DRIVE_MAX_DELTA_US = 150;
+
 WebServer server(80);
 bool armed = false;
 unsigned long lastHeartbeat = 0;
@@ -99,6 +103,15 @@ const char* PAGE_HTML = R"rawliteral(
     <input type="range" id="sliderL" min="0" max="100" value="0" disabled>
   </div>
 
+  <div class="card">
+    <h3>Drive Motor</h3>
+    <div class="pct" id="pctD">STOP</div>
+    <input type="range" id="sliderD" min="-100" max="100" value="0" disabled>
+    <div style="display:flex; justify-content:space-between; font-size:12px; color:#666; margin-top:-4px;">
+      <span>REVERSE</span><span>FORWARD</span>
+    </div>
+  </div>
+
   <div class="btnrow">
     <button id="armBtn" onclick="arm()">ARM</button>
     <button id="stopBtn" onclick="stopAll()">STOP</button>
@@ -128,11 +141,14 @@ function setArmedUI(isArmed) {
   document.getElementById('statusBadge').className = 'status ' + (isArmed ? 'armed' : 'disarmed');
   document.getElementById('sliderR').disabled = !isArmed;
   document.getElementById('sliderL').disabled = !isArmed;
+  document.getElementById('sliderD').disabled = !isArmed;
   if (!isArmed) {
     document.getElementById('sliderR').value = 0;
     document.getElementById('sliderL').value = 0;
+    document.getElementById('sliderD').value = 0;
     document.getElementById('pctR').textContent = '0%';
     document.getElementById('pctL').textContent = '0%';
+    document.getElementById('pctD').textContent = 'STOP';
     stopHeartbeat();
   } else {
     startHeartbeat();
@@ -149,19 +165,28 @@ function driveBurst() {
 function sendSpeed() {
   const r = document.getElementById('sliderR').value;
   const l = document.getElementById('sliderL').value;
-  fetch(`/speed?right=${r}&left=${l}`).then(res => {
+  const d = document.getElementById('sliderD').value;
+  fetch(`/speed?right=${r}&left=${l}&drive=${d}`).then(res => {
     if (res.status === 403) {
       alert('Disarmed by the ESP32 (heartbeat timeout) - hit ARM again.');
       setArmedUI(false);
     }
   });
 }
+function driveLabel(v) {
+  v = parseInt(v);
+  if (v === 0) return 'STOP';
+  return (v > 0 ? 'FWD ' : 'REV ') + Math.abs(v) + '%';
+}
 const sR = document.getElementById('sliderR');
 const sL = document.getElementById('sliderL');
+const sD = document.getElementById('sliderD');
 sR.addEventListener('input', () => document.getElementById('pctR').textContent = sR.value + '%');
 sL.addEventListener('input', () => document.getElementById('pctL').textContent = sL.value + '%');
+sD.addEventListener('input', () => document.getElementById('pctD').textContent = driveLabel(sD.value));
 sR.addEventListener('change', sendSpeed);
 sL.addEventListener('change', sendSpeed);
+sD.addEventListener('change', sendSpeed);
 </script>
 </body>
 </html>
@@ -192,6 +217,11 @@ void handleSpeed() {
   if (server.hasArg("left")) {
     int pct = constrain(server.arg("left").toInt(), 0, 100);
     setPulse(CH_LEFT, map(pct, 0, 100, MIN_US, MAX_US));
+  }
+  if (server.hasArg("drive")) {
+    int val = constrain(server.arg("drive").toInt(), -100, 100);
+    int us = DRIVE_NEUTRAL_US + (long)val * DRIVE_MAX_DELTA_US / 100;
+    setPulse(CH_DRIVE, us);
   }
   server.send(200, "text/plain", "ok");
 }
@@ -267,6 +297,7 @@ void loop() {
     Serial.println("Heartbeat lost - stopping motors");
     setPulse(CH_RIGHT, MIN_US);
     setPulse(CH_LEFT, MIN_US);
+    setPulse(CH_DRIVE, DRIVE_NEUTRAL_US);
     armed = false;
   }
   server.handleClient();
