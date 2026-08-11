@@ -24,12 +24,12 @@ const int GATE_OPEN_ANGLE   = 160;  // placeholder - adjust after physical test
 // QuicRun 1060 is a bidirectional car ESC - neutral is 1500us, NOT 1000us like the
 // flywheel ESCs. Arming means holding neutral, not minimum.
 const int DRIVE_NEUTRAL_US = 1500;
-const int DRIVE_FORWARD_US = 1650;  // conservative starting point, partial throttle - raise gradually after testing
+const int DRIVE_FORWARD_US = 1800;  // raised from 1650 after first successful test confirmed wiring/direction/calibration - still raise gradually
 const unsigned long DRIVE_BURST_MS = 2000;
 
-// Continuous drive slider: same +/-150us envelope already proven safe by Drive Burst above.
+// Continuous drive slider: same +/-300us envelope as Drive Burst above.
 // slider value -100..100 -> DRIVE_NEUTRAL_US +/- DRIVE_MAX_DELTA_US
-const int DRIVE_MAX_DELTA_US = 150;
+const int DRIVE_MAX_DELTA_US = 300;
 
 WebServer server(80);
 bool armed = false;
