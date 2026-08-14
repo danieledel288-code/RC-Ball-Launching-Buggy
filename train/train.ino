@@ -50,7 +50,7 @@ const int DEFAULT_BALL_COUNT    = 4;     // total balls fired across the whole r
 const int DEFAULT_SHOTS_PER_LEG = 4;     // balls fired per one-way pass across the net
                                           // (4 balls + 4 per pass = one pass, no reversal, by default)
 const int DEFAULT_FLYWHEEL_PCT  = 75;    // flywheel power, 0-100
-const int DEFAULT_DRIVE_PCT     = 50;    // drive power, 0-100 (of the +/-300us envelope)
+const int DEFAULT_DRIVE_PCT     = 60;    // drive power, 0-100 (of the +/-300us envelope)
 
 // Time to drive the FULL net length at the configured drive power, in ms.
 // This is not measured yet - it's a placeholder. Bench test it: run Drive
@@ -60,8 +60,11 @@ const int DEFAULT_DRIVE_PCT     = 50;    // drive power, 0-100 (of the +/-300us 
 // this divided by "balls per pass," computed automatically.
 const int DEFAULT_TRAVERSE_MS = 2500;
 
+// Fixed, not user-adjustable - 500ms tested well and didn't need tuning,
+// so it's not worth a slider on screen.
+const int GATE_OPEN_MS = 500;
+
 // --- Advanced defaults - tucked under the Advanced Settings disclosure ---
-const int DEFAULT_GATE_OPEN_MS         = 350;  // how long the gate stays open per shot
 const int DEFAULT_POST_SHOOT_PAUSE_MS  = 300;  // gate finishes closing before the drive segment starts
 const int DEFAULT_POST_DRIVE_PAUSE_MS  = 500;  // buggy comes to a full stop before the next gate opens
 
@@ -75,7 +78,7 @@ const unsigned long FLYWHEEL_SPINUP_MS = 500;  // let flywheels reach speed befo
 
 WebServer server(80);
 
-enum TrainState { T_IDLE, T_SPINUP, T_SHOOT, T_POST_SHOOT, T_DRIVE, T_POST_DRIVE, T_TEST_DRIVE };
+enum TrainState { T_IDLE, T_SPINUP, T_SHOOT, T_POST_SHOOT, T_DRIVE, T_POST_DRIVE, T_TEST_DRIVE, T_TEST_PAUSE };
 TrainState trainState = T_IDLE;
 
 int totalBalls        = DEFAULT_BALL_COUNT;
@@ -83,13 +86,13 @@ int shotsPerLeg        = DEFAULT_SHOTS_PER_LEG;
 int flywheelPct        = DEFAULT_FLYWHEEL_PCT;
 int drivePct           = DEFAULT_DRIVE_PCT;
 int traverseMs         = DEFAULT_TRAVERSE_MS;
-int gateOpenMs          = DEFAULT_GATE_OPEN_MS;
 int postShootPauseMs    = DEFAULT_POST_SHOOT_PAUSE_MS;
 int postDrivePauseMs    = DEFAULT_POST_DRIVE_PAUSE_MS;
 
 int shotIndex   = 0;   // total shots fired so far, 0-based
 int legShotCount = 0;  // shots fired within the current pass, resets at each leg boundary
 int direction   = 1;   // 1 = forward, -1 = reverse, flips once a full pass completes
+int testSegmentsRemaining = 0;  // counts down during a traverse test, mirrors a real leg's segment count
 unsigned long phaseStart = 0;
 
 bool armed = false;
@@ -126,6 +129,13 @@ void beginShoot() {
   phaseStart = millis();
 }
 
+void beginTestSegment() {
+  int us = DRIVE_NEUTRAL_US + (long)drivePct * DRIVE_MAX_DELTA_US / 100;  // test always drives forward
+  setPulse(CH_DRIVE, us);
+  trainState = T_TEST_DRIVE;
+  phaseStart = millis();
+}
+
 int segmentDriveMs() {
   int perLeg = shotsPerLeg < 1 ? 1 : shotsPerLeg;
   return traverseMs / perLeg;
@@ -145,7 +155,7 @@ void advanceTrain() {
       break;
 
     case T_SHOOT:
-      if (elapsed >= (unsigned long)gateOpenMs) {
+      if (elapsed >= (unsigned long)GATE_OPEN_MS) {
         setServoAngle(CH_SERVO, GATE_CLOSED_ANGLE);
         trainState = T_POST_SHOOT;
         phaseStart = millis();
@@ -156,6 +166,9 @@ void advanceTrain() {
       if (elapsed >= (unsigned long)postShootPauseMs) {
         shotIndex++;
         legShotCount++;
+        Serial.print("Shot fired: #"); Serial.print(shotIndex);
+        Serial.print(" of "); Serial.print(totalBalls);
+        Serial.print(" dir="); Serial.println(direction);
         if (shotIndex >= totalBalls) {
           stopTrain();  // that was the last ball, no more driving needed
           break;
@@ -182,20 +195,37 @@ void advanceTrain() {
           // end - flip direction for the next pass.
           direction = -direction;
           legShotCount = 0;
+          Serial.println("Pass complete - reversing direction");
         }
         beginShoot();
       }
       break;
 
     case T_TEST_DRIVE:
-      // Drive-only calibration run - no gate, no flywheels, so it can be
-      // repeated freely while dialing in Drive Power / Traverse Time
-      // without burning through the loaded balls.
-      if (elapsed >= (unsigned long)traverseMs) {
+      // Drive-only calibration run - no gate, no flywheels. Runs the same
+      // number of stop-start segments as a real pass (see "balls per pass")
+      // instead of one continuous burst, because repeated starts from a
+      // dead stop cover noticeably less distance per second of drive time
+      // than one continuous run at the same total time - a continuous test
+      // would calibrate a Traverse Time that then falls short in the real,
+      // segmented run.
+      if (elapsed >= (unsigned long)segmentDriveMs()) {
         setPulse(CH_DRIVE, DRIVE_NEUTRAL_US);
-        trainState = T_IDLE;
-        armed = false;
-        Serial.println("Traverse test complete");
+        testSegmentsRemaining--;
+        if (testSegmentsRemaining <= 0) {
+          trainState = T_IDLE;
+          armed = false;
+          Serial.println("Traverse test complete");
+        } else {
+          trainState = T_TEST_PAUSE;
+          phaseStart = millis();
+        }
+      }
+      break;
+
+    case T_TEST_PAUSE:
+      if (elapsed >= (unsigned long)postDrivePauseMs) {
+        beginTestSegment();
       }
       break;
 
@@ -306,7 +336,7 @@ const char* PAGE_HTML = R"rawliteral(
 
   .hint { font-size: 12px; color: var(--ink-soft); margin: -10px 0 4px; }
 
-  .two-col { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+  .two-col { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin-bottom: 14px; }
 
   details.card summary {
     list-style: none; cursor: pointer; display: flex; align-items: center;
@@ -381,9 +411,9 @@ const char* PAGE_HTML = R"rawliteral(
     <div class="field">
       <div class="field-row">
         <div class="field-label"><svg viewBox="0 0 18 18" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M2 9h14"/><path d="M12 5l4 4-4 4"/><path d="M6 5 2 9l4 4"/></svg><label>Drive power</label></div>
-        <span class="val" id="driveVal">50%</span>
+        <span class="val" id="driveVal">60%</span>
       </div>
-      <input type="range" id="drive" min="0" max="100" value="50">
+      <input type="range" id="drive" min="0" max="100" value="60">
     </div>
 
     <div class="field">
@@ -404,18 +434,9 @@ const char* PAGE_HTML = R"rawliteral(
           <svg viewBox="0 0 18 18" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M2 9h14"/><path d="M12 5l4 4-4 4"/></svg>
           <label>Traverse test</label>
         </div>
-        <div class="hint" style="margin-top:0;">Drives forward at the Drive Power and Traverse Time set above, no gate, no flywheels. Watch how far it actually goes, adjust those two sliders, run it again - once it covers the real net length you're calibrated, and every shot uses that same speed and time to work out where it is.</div>
+        <div class="hint" style="margin-top:0;">Runs the same number of stop-start segments as "balls per pass," at the Drive Power and Traverse Time set above - no gate, no flywheels. This matches the real run's repeated-stop behavior, so it may cover less distance than one continuous drive would. Watch how far it actually goes, adjust the two sliders above, run it again - once it covers the real net length you're calibrated, and every shot uses that same speed and time to work out where it is.</div>
         <button id="testDriveBtn" type="button" onclick="testDrive()" style="width:100%; margin-top:10px; background:var(--surface); color:var(--green); border:1.5px solid var(--green);">RUN TRAVERSE TEST</button>
       </div>
-      <div class="field">
-        <div class="field-row">
-          <div class="field-label"><svg viewBox="0 0 18 18" fill="none" stroke="currentColor" stroke-width="1.6"><circle cx="9" cy="9" r="6.5"/><path d="M9 5.5V9l3 2"/></svg><label>Gate open time</label></div>
-          <span class="val" id="gateVal">350ms</span>
-        </div>
-        <input type="range" id="gate" min="150" max="900" step="50" value="350">
-        <div class="hint">Keep well under 1s - balls are rolling continuously.</div>
-      </div>
-
       <div class="field">
         <div class="field-row">
           <div class="field-label"><svg viewBox="0 0 18 18" fill="none" stroke="currentColor" stroke-width="1.6"><circle cx="9" cy="9" r="6.5"/><path d="M9 5.5V9l3 2"/></svg><label>Post-shoot pause</label></div>
@@ -446,7 +467,7 @@ const char* PAGE_HTML = R"rawliteral(
 let heartbeatTimer = null;
 let pollTimer = null;
 let running = false;
-const PARAM_IDS = ['balls','perleg','fw','drive','traverse','gate','pshoot','pdrive'];
+const PARAM_IDS = ['balls','perleg','fw','drive','traverse','pshoot','pdrive'];
 const BUTTON_IDS = ['startBtn','testDriveBtn'];
 
 function startHeartbeat() {
@@ -478,7 +499,8 @@ function startTrain() {
 function testDrive() {
   const drive = document.getElementById('drive').value;
   const traverse = document.getElementById('traverse').value;
-  beginRun(`/testdrive?drive=${drive}&traverse=${traverse}`);
+  const perleg = document.getElementById('perleg').value;
+  beginRun(`/testdrive?drive=${drive}&traverse=${traverse}&perleg=${perleg}`);
 }
 
 function stopTrain() {
@@ -532,7 +554,6 @@ function pollStatus() {
 document.getElementById('fw').addEventListener('input', function() { document.getElementById('fwVal').textContent = this.value + '%'; });
 document.getElementById('drive').addEventListener('input', function() { document.getElementById('driveVal').textContent = this.value + '%'; });
 document.getElementById('traverse').addEventListener('input', function() { document.getElementById('traverseVal').textContent = (this.value / 1000).toFixed(1) + 's'; });
-document.getElementById('gate').addEventListener('input', function() { document.getElementById('gateVal').textContent = this.value + 'ms'; });
 document.getElementById('pshoot').addEventListener('input', function() { document.getElementById('pshootVal').textContent = this.value + 'ms'; });
 document.getElementById('pdrive').addEventListener('input', function() { document.getElementById('pdriveVal').textContent = this.value + 'ms'; });
 
@@ -552,7 +573,6 @@ void handleTrainStart() {
   if (server.hasArg("fw"))       flywheelPct      = constrain(server.arg("fw").toInt(), 0, 100);
   if (server.hasArg("drive"))    drivePct         = constrain(server.arg("drive").toInt(), 0, 100);
   if (server.hasArg("traverse")) traverseMs       = constrain(server.arg("traverse").toInt(), 200, 15000);
-  if (server.hasArg("gate"))     gateOpenMs       = constrain(server.arg("gate").toInt(), 100, 2000);
   if (server.hasArg("pshoot"))   postShootPauseMs = constrain(server.arg("pshoot").toInt(), 50, 3000);
   if (server.hasArg("pdrive"))   postDrivePauseMs = constrain(server.arg("pdrive").toInt(), 50, 5000);
 
@@ -574,18 +594,17 @@ void handleTrainStart() {
 }
 
 void handleTestDrive() {
-  if (server.hasArg("drive"))    drivePct   = constrain(server.arg("drive").toInt(), 0, 100);
-  if (server.hasArg("traverse")) traverseMs = constrain(server.arg("traverse").toInt(), 200, 15000);
+  if (server.hasArg("drive"))    drivePct    = constrain(server.arg("drive").toInt(), 0, 100);
+  if (server.hasArg("traverse")) traverseMs  = constrain(server.arg("traverse").toInt(), 200, 15000);
+  if (server.hasArg("perleg"))   shotsPerLeg = constrain(server.arg("perleg").toInt(), 1, 50);
 
   direction = 1;  // test always drives forward - avoid showing a stale REVERSE badge left over from the last real run
   armed = true;
   lastHeartbeat = millis();
 
-  int us = DRIVE_NEUTRAL_US + (long)drivePct * DRIVE_MAX_DELTA_US / 100;  // always tests forward
-  setPulse(CH_DRIVE, us);
-  trainState = T_TEST_DRIVE;
-  phaseStart = millis();
-  Serial.println("Traverse test started");
+  testSegmentsRemaining = shotsPerLeg < 1 ? 1 : shotsPerLeg;
+  beginTestSegment();
+  Serial.print("Traverse test started: "); Serial.print(testSegmentsRemaining); Serial.println(" segment(s)");
   server.send(200, "text/plain", "testing");
 }
 
@@ -604,12 +623,13 @@ void handleTrainStatus() {
     case T_POST_SHOOT: stateStr = "postshoot";  break;
     case T_DRIVE:      stateStr = "drive";      break;
     case T_POST_DRIVE: stateStr = "postdrive";  break;
-    case T_TEST_DRIVE: stateStr = "testdrive";  break;
+    case T_TEST_DRIVE:
+    case T_TEST_PAUSE: stateStr = "testdrive";  break;
     default:           stateStr = "idle";       break;
   }
   // Test drive doesn't touch the ball sequence at all - report 0/0 rather
   // than whatever's left over from the last real run.
-  bool isTest = (trainState == T_TEST_DRIVE);
+  bool isTest = (trainState == T_TEST_DRIVE || trainState == T_TEST_PAUSE);
   int ballDisplay = (trainState == T_IDLE || isTest) ? 0 : (shotIndex + 1);
   int totalDisplay = isTest ? 0 : totalBalls;
   String json = String("{\"state\":\"") + stateStr + "\",\"ball\":" + String(ballDisplay) +
