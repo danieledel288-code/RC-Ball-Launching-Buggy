@@ -3,9 +3,18 @@
 #include <Wire.h>
 #include <Adafruit_PWMServoDriver.h>
 
-// Train mode: unattended demo sequencer. Set a ball count and it fires that
-// many balls one at a time out of the storage net, alternating drive
-// direction each shot so the buggy sweeps back and forth across the net.
+// Train mode: unattended demo sequencer.
+//
+// Mechanism (rewritten 2026-08-14 - the buggy is fully stopped for every
+// shot, it does not fire while moving):
+//   SHOOT (gate opens, buggy stays neutral) -> cooldown (gate closes) ->
+//   DRIVE one segment -> cooldown (buggy comes to a full stop) -> SHOOT ...
+// "Balls per pass" splits the full net length into that many equal segments
+// and fires one ball at the start of each segment; direction only flips once
+// a full pass (leg) is complete, not after every shot. Flywheels spin up
+// once at the start and stay spinning through the entire run - they are
+// always up to speed before the gate opens for any shot.
+//
 // Built for the Blueprint contest demo. See flywheel_control/flywheel_control.ino
 // for the manual single-shot control page this is based on.
 
@@ -36,47 +45,52 @@ const int GATE_OPEN_ANGLE   = 20;
 const int DRIVE_NEUTRAL_US   = 1500;
 const int DRIVE_MAX_DELTA_US = 300;   // +/-300us envelope, same as flywheel_control.ino
 
-// --- Train defaults - all overridable from the web UI before pressing Start ---
-const int DEFAULT_BALL_COUNT     = 5;
-const int DEFAULT_FLYWHEEL_PCT   = 75;    // flywheel power, 0-100
-const int DEFAULT_DRIVE_PCT      = 50;    // drive power, 0-100 (of the +/-300us envelope)
-const int DEFAULT_DRIVE_BURST_MS = 2500;  // how long the drive burst runs per shot - tune to net length
-const int DEFAULT_GATE_OPEN_MS   = 350;   // how long the gate stays open per ball
+// --- Primary train defaults - shown on the main screen ---
+const int DEFAULT_BALL_COUNT    = 4;     // total balls fired across the whole run
+const int DEFAULT_SHOTS_PER_LEG = 4;     // balls fired per one-way pass across the net
+                                          // (4 balls + 4 per pass = one pass, no reversal, by default)
+const int DEFAULT_FLYWHEEL_PCT  = 75;    // flywheel power, 0-100
+const int DEFAULT_DRIVE_PCT     = 50;    // drive power, 0-100 (of the +/-300us envelope)
+
+// Time to drive the FULL net length at the configured drive power, in ms.
+// This is not measured yet - it's a placeholder. Bench test it: run Drive
+// Power at a fixed value for a few seconds, see how far the buggy actually
+// travels, then scale the time up or down until it covers the real net
+// length, and set this to that value. Each shot's actual drive segment is
+// this divided by "balls per pass," computed automatically.
+const int DEFAULT_TRAVERSE_MS = 2500;
+
+// --- Advanced defaults - tucked under the Advanced Settings disclosure ---
+const int DEFAULT_GATE_OPEN_MS         = 350;  // how long the gate stays open per shot
+const int DEFAULT_POST_SHOOT_PAUSE_MS  = 300;  // gate finishes closing before the drive segment starts
+const int DEFAULT_POST_DRIVE_PAUSE_MS  = 500;  // buggy comes to a full stop before the next gate opens
 
 // Balls are constantly rolling in the storage net, so the gate has to open
 // and close fast enough that a second ball can't slip through behind the
-// first one. Target: gate open time + the servo's own mechanical close
-// speed both land comfortably under ~1000ms. Start at the default below and
-// tune GATE_OPEN_MS down from the web UI if balls start doubling up; tune it
-// up if the gate is closing on a ball still mid-pass.
+// first one. Keep gate open time + the post-shoot pause comfortably under
+// ~1000ms combined while tuning.
 const int GATE_CYCLE_BUDGET_MS = 1000;
-
-// How long the drive motor sits at neutral between shots before reversing.
-// This has to be long enough for the buggy to actually coast to a stop -
-// reversing a moving buggy straight from one direction to the other stresses
-// the drive ESC and gearbox and can make the direction change unreliable.
-// 700ms is a starting guess, not a measured value - tune from the web UI
-// against how much momentum the buggy actually carries.
-const int DEFAULT_REVERSAL_PAUSE_MS = 700;
 
 const unsigned long FLYWHEEL_SPINUP_MS = 500;  // let flywheels reach speed before the first shot
 
 WebServer server(80);
 
-enum TrainState { T_IDLE, T_SPINUP, T_FIRING, T_GAP };
+enum TrainState { T_IDLE, T_SPINUP, T_SHOOT, T_POST_SHOOT, T_DRIVE, T_POST_DRIVE };
 TrainState trainState = T_IDLE;
 
-int totalBalls      = DEFAULT_BALL_COUNT;
-int flywheelPct     = DEFAULT_FLYWHEEL_PCT;
-int drivePct        = DEFAULT_DRIVE_PCT;
-int driveBurstMs    = DEFAULT_DRIVE_BURST_MS;
-int gateOpenMs       = DEFAULT_GATE_OPEN_MS;
-int reversalPauseMs  = DEFAULT_REVERSAL_PAUSE_MS;
+int totalBalls        = DEFAULT_BALL_COUNT;
+int shotsPerLeg        = DEFAULT_SHOTS_PER_LEG;
+int flywheelPct        = DEFAULT_FLYWHEEL_PCT;
+int drivePct           = DEFAULT_DRIVE_PCT;
+int traverseMs         = DEFAULT_TRAVERSE_MS;
+int gateOpenMs          = DEFAULT_GATE_OPEN_MS;
+int postShootPauseMs    = DEFAULT_POST_SHOOT_PAUSE_MS;
+int postDrivePauseMs    = DEFAULT_POST_DRIVE_PAUSE_MS;
 
-int shotIndex = 0;   // 0-based index of the ball currently in flight
-int direction = 1;   // 1 = forward, -1 = reverse, alternates every shot
+int shotIndex   = 0;   // total shots fired so far, 0-based
+int legShotCount = 0;  // shots fired within the current pass, resets at each leg boundary
+int direction   = 1;   // 1 = forward, -1 = reverse, flips once a full pass completes
 unsigned long phaseStart = 0;
-bool gateClosedThisShot = false;
 
 bool armed = false;
 unsigned long lastHeartbeat = 0;
@@ -104,16 +118,17 @@ void stopTrain() {
   allNeutral();
 }
 
-void beginShot() {
-  // Open the gate and start the drive burst for this shot together - the
-  // gate closes again partway through (see advanceTrain), the drive burst
-  // keeps running past that so the buggy finishes sweeping across the net.
+void beginShoot() {
+  // Drive stays neutral through the whole shoot phase - the buggy is
+  // stopped for every shot, it never fires while moving.
   setServoAngle(CH_SERVO, GATE_OPEN_ANGLE);
-  int us = DRIVE_NEUTRAL_US + (long)direction * drivePct * DRIVE_MAX_DELTA_US / 100;
-  setPulse(CH_DRIVE, us);
-  gateClosedThisShot = false;
-  trainState = T_FIRING;
+  trainState = T_SHOOT;
   phaseStart = millis();
+}
+
+int segmentDriveMs() {
+  int perLeg = shotsPerLeg < 1 ? 1 : shotsPerLeg;
+  return traverseMs / perLeg;
 }
 
 void advanceTrain() {
@@ -122,32 +137,53 @@ void advanceTrain() {
 
   switch (trainState) {
     case T_SPINUP:
+      // Flywheels have been spinning since handleTrainStart() - this is
+      // just the settle time before the very first shot of the run.
       if (elapsed >= FLYWHEEL_SPINUP_MS) {
-        beginShot();
+        beginShoot();
       }
       break;
 
-    case T_FIRING:
-      if (!gateClosedThisShot && elapsed >= (unsigned long)gateOpenMs) {
+    case T_SHOOT:
+      if (elapsed >= (unsigned long)gateOpenMs) {
         setServoAngle(CH_SERVO, GATE_CLOSED_ANGLE);
-        gateClosedThisShot = true;
-      }
-      if (elapsed >= (unsigned long)driveBurstMs) {
-        setPulse(CH_DRIVE, DRIVE_NEUTRAL_US);
-        trainState = T_GAP;
+        trainState = T_POST_SHOOT;
         phaseStart = millis();
       }
       break;
 
-    case T_GAP:
-      if (elapsed >= (unsigned long)reversalPauseMs) {
+    case T_POST_SHOOT:
+      if (elapsed >= (unsigned long)postShootPauseMs) {
         shotIndex++;
+        legShotCount++;
         if (shotIndex >= totalBalls) {
-          stopTrain();
-        } else {
-          direction = -direction;
-          beginShot();  // flywheels are already spinning, fire immediately
+          stopTrain();  // that was the last ball, no more driving needed
+          break;
         }
+        int us = DRIVE_NEUTRAL_US + (long)direction * drivePct * DRIVE_MAX_DELTA_US / 100;
+        setPulse(CH_DRIVE, us);
+        trainState = T_DRIVE;
+        phaseStart = millis();
+      }
+      break;
+
+    case T_DRIVE:
+      if (elapsed >= (unsigned long)segmentDriveMs()) {
+        setPulse(CH_DRIVE, DRIVE_NEUTRAL_US);
+        trainState = T_POST_DRIVE;
+        phaseStart = millis();
+      }
+      break;
+
+    case T_POST_DRIVE:
+      if (elapsed >= (unsigned long)postDrivePauseMs) {
+        if (legShotCount >= shotsPerLeg) {
+          // Full pass complete and the buggy has just arrived at the far
+          // end - flip direction for the next pass.
+          direction = -direction;
+          legShotCount = 0;
+        }
+        beginShoot();
       }
       break;
 
@@ -209,8 +245,8 @@ const char* PAGE_HTML = R"rawliteral(
   }
   .status .dot { width: 7px; height: 7px; border-radius: 50%; background: currentColor; }
   .status.idle { background: var(--surface); color: var(--ink-soft); border: 1px solid var(--border); }
-  .status.spinup, .status.gap { background: var(--gold-bg); color: var(--gold); }
-  .status.firing { background: var(--green-soft); color: var(--green); }
+  .status.pending { background: var(--gold-bg); color: var(--gold); }
+  .status.active { background: var(--green-soft); color: var(--green); }
 
   .progress-card {
     background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius);
@@ -258,6 +294,18 @@ const char* PAGE_HTML = R"rawliteral(
 
   .hint { font-size: 12px; color: var(--ink-soft); margin: -10px 0 4px; }
 
+  .two-col { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+
+  details.card summary {
+    list-style: none; cursor: pointer; display: flex; align-items: center;
+    justify-content: space-between; font-size: 13px; font-weight: 700; color: var(--ink-soft);
+  }
+  details.card summary::-webkit-details-marker { display: none; }
+  details.card summary .chev { transition: transform 0.15s ease-out; }
+  details.card[open] summary .chev { transform: rotate(90deg); }
+  details.card summary::after { content: ''; }
+  details.card .adv-body { margin-top: 14px; }
+
   .btnrow { display: flex; gap: 10px; margin-top: 4px; }
   button {
     flex: 1; padding: 16px; font-size: 15px; font-weight: 700; letter-spacing: 0.02em;
@@ -290,11 +338,23 @@ const char* PAGE_HTML = R"rawliteral(
   </div>
 
   <div class="card">
-    <div class="field-label" style="margin-bottom:10px;">
-      <svg viewBox="0 0 18 18" fill="none" stroke="currentColor" stroke-width="1.6"><circle cx="9" cy="9" r="6.5"/><circle cx="9" cy="9" r="2.3"/></svg>
-      <span class="card-title" style="margin:0;">Balls to fire</span>
+    <div class="two-col">
+      <div>
+        <div class="field-label" style="margin-bottom:10px;">
+          <svg viewBox="0 0 18 18" fill="none" stroke="currentColor" stroke-width="1.6"><circle cx="9" cy="9" r="6.5"/><circle cx="9" cy="9" r="2.3"/></svg>
+          <span class="card-title" style="margin:0;">Balls to fire</span>
+        </div>
+        <input type="number" id="balls" min="1" max="100" value="4">
+      </div>
+      <div>
+        <div class="field-label" style="margin-bottom:10px;">
+          <svg viewBox="0 0 18 18" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M4 15V3"/><path d="M4 4h9l-2 3 2 3H4"/></svg>
+          <span class="card-title" style="margin:0;">Balls per pass</span>
+        </div>
+        <input type="number" id="perleg" min="1" max="50" value="4">
+      </div>
     </div>
-    <input type="number" id="balls" min="1" max="100" value="5">
+    <div class="hint">Balls per pass = shots in one direction before it reverses. Set it equal to "balls to fire" for a single one-way run.</div>
   </div>
 
   <div class="card">
@@ -316,30 +376,45 @@ const char* PAGE_HTML = R"rawliteral(
 
     <div class="field">
       <div class="field-row">
-        <div class="field-label"><svg viewBox="0 0 18 18" fill="none" stroke="currentColor" stroke-width="1.6"><circle cx="9" cy="9" r="6.5"/><path d="M9 5.5V9l3 2"/></svg><label>Drive burst length</label></div>
-        <span class="val" id="burstVal">2.5s</span>
+        <div class="field-label"><svg viewBox="0 0 18 18" fill="none" stroke="currentColor" stroke-width="1.6"><circle cx="9" cy="9" r="6.5"/><path d="M9 5.5V9l3 2"/></svg><label>Traverse time (full net length)</label></div>
+        <span class="val" id="traverseVal">2.5s</span>
       </div>
-      <input type="range" id="burst" min="500" max="4000" step="100" value="2500">
-    </div>
-
-    <div class="field">
-      <div class="field-row">
-        <div class="field-label"><svg viewBox="0 0 18 18" fill="none" stroke="currentColor" stroke-width="1.6"><circle cx="9" cy="9" r="6.5"/><path d="M9 5.5V9l3 2"/></svg><label>Direction change pause</label></div>
-        <span class="val" id="pauseVal">700ms</span>
-      </div>
-      <input type="range" id="pause" min="200" max="3000" step="50" value="700">
-      <div class="hint">Time at neutral before reversing - give the buggy enough to actually stop first.</div>
-    </div>
-
-    <div class="field">
-      <div class="field-row">
-        <div class="field-label"><svg viewBox="0 0 18 18" fill="none" stroke="currentColor" stroke-width="1.6"><circle cx="9" cy="9" r="6.5"/><path d="M9 5.5V9l3 2"/></svg><label>Gate open time</label></div>
-        <span class="val" id="gateVal">350ms</span>
-      </div>
-      <input type="range" id="gate" min="150" max="900" step="50" value="350">
-      <div class="hint">Keep this well under 1s while tuning - balls are rolling continuously.</div>
+      <input type="range" id="traverse" min="500" max="8000" step="100" value="2500">
+      <div class="hint">Not measured yet - bench test at this drive power and set this to how long a full end-to-end run actually takes.</div>
     </div>
   </div>
+
+  <details class="card">
+    <summary>Advanced settings <span class="chev">&#8250;</span></summary>
+    <div class="adv-body">
+      <div class="field">
+        <div class="field-row">
+          <div class="field-label"><svg viewBox="0 0 18 18" fill="none" stroke="currentColor" stroke-width="1.6"><circle cx="9" cy="9" r="6.5"/><path d="M9 5.5V9l3 2"/></svg><label>Gate open time</label></div>
+          <span class="val" id="gateVal">350ms</span>
+        </div>
+        <input type="range" id="gate" min="150" max="900" step="50" value="350">
+        <div class="hint">Keep well under 1s - balls are rolling continuously.</div>
+      </div>
+
+      <div class="field">
+        <div class="field-row">
+          <div class="field-label"><svg viewBox="0 0 18 18" fill="none" stroke="currentColor" stroke-width="1.6"><circle cx="9" cy="9" r="6.5"/><path d="M9 5.5V9l3 2"/></svg><label>Post-shoot pause</label></div>
+          <span class="val" id="pshootVal">300ms</span>
+        </div>
+        <input type="range" id="pshoot" min="100" max="3000" step="50" value="300">
+        <div class="hint">Lets the gate finish closing before the drive segment starts.</div>
+      </div>
+
+      <div class="field" style="margin-bottom:0;">
+        <div class="field-row">
+          <div class="field-label"><svg viewBox="0 0 18 18" fill="none" stroke="currentColor" stroke-width="1.6"><circle cx="9" cy="9" r="6.5"/><path d="M9 5.5V9l3 2"/></svg><label>Post-drive pause</label></div>
+          <span class="val" id="pdriveVal">500ms</span>
+        </div>
+        <input type="range" id="pdrive" min="100" max="5000" step="50" value="500">
+        <div class="hint">Lets the buggy come to a full stop before the next gate opens.</div>
+      </div>
+    </div>
+  </details>
 
   <div class="btnrow">
     <button id="startBtn" onclick="startTrain()">START TRAIN</button>
@@ -351,6 +426,7 @@ const char* PAGE_HTML = R"rawliteral(
 let heartbeatTimer = null;
 let pollTimer = null;
 let running = false;
+const CONFIG_IDS = ['balls','perleg','fw','drive','traverse','gate','pshoot','pdrive','startBtn'];
 
 function startHeartbeat() {
   if (heartbeatTimer) return;
@@ -362,19 +438,13 @@ function stopHeartbeat() {
 }
 
 function setConfigEnabled(enabled) {
-  ['balls','fw','drive','burst','pause','gate','startBtn'].forEach(id => {
-    document.getElementById(id).disabled = !enabled;
-  });
+  CONFIG_IDS.forEach(id => { document.getElementById(id).disabled = !enabled; });
 }
 
 function startTrain() {
-  const balls = document.getElementById('balls').value;
-  const fw = document.getElementById('fw').value;
-  const drive = document.getElementById('drive').value;
-  const burst = document.getElementById('burst').value;
-  const pause = document.getElementById('pause').value;
-  const gate = document.getElementById('gate').value;
-  fetch(`/trainstart?balls=${balls}&fw=${fw}&drive=${drive}&burst=${burst}&pause=${pause}&gate=${gate}`)
+  const params = CONFIG_IDS.filter(id => id !== 'startBtn')
+    .map(id => `${id}=${document.getElementById(id).value}`).join('&');
+  fetch(`/trainstart?${params}`)
     .then(() => {
       running = true;
       setConfigEnabled(false);
@@ -393,13 +463,15 @@ function stopTrain() {
 
 const FWD_ARROW = '<path d="M2 9h13"/><path d="M11 5l4 4-4 4"/>';
 const REV_ARROW = '<path d="M16 9H3"/><path d="M7 5 3 9l4 4"/>';
+const ACTIVE_STATES = ['shoot', 'drive'];
+const STATUS_LABELS = { spinup: 'SPINNING UP', shoot: 'FIRING', postshoot: 'COOLDOWN', drive: 'DRIVING', postdrive: 'COOLDOWN' };
 
 function pollStatus() {
   fetch('/trainstatus').then(r => r.json()).then(s => {
     const badge = document.getElementById('statusBadge');
     const isRunning = s.state !== 'idle';
-    badge.className = 'status ' + s.state;
-    badge.innerHTML = '<span class="dot"></span>' + (isRunning ? s.state.toUpperCase() : 'IDLE');
+    badge.className = 'status ' + (!isRunning ? 'idle' : (ACTIVE_STATES.includes(s.state) ? 'active' : 'pending'));
+    badge.innerHTML = '<span class="dot"></span>' + (isRunning ? (STATUS_LABELS[s.state] || s.state.toUpperCase()) : 'IDLE');
 
     document.getElementById('ballNum').textContent = s.ball;
     document.getElementById('ballTotal').textContent = s.total;
@@ -431,9 +503,10 @@ function pollStatus() {
 
 document.getElementById('fw').addEventListener('input', function() { document.getElementById('fwVal').textContent = this.value + '%'; });
 document.getElementById('drive').addEventListener('input', function() { document.getElementById('driveVal').textContent = this.value + '%'; });
-document.getElementById('burst').addEventListener('input', function() { document.getElementById('burstVal').textContent = (this.value / 1000).toFixed(1) + 's'; });
-document.getElementById('pause').addEventListener('input', function() { document.getElementById('pauseVal').textContent = this.value + 'ms'; });
+document.getElementById('traverse').addEventListener('input', function() { document.getElementById('traverseVal').textContent = (this.value / 1000).toFixed(1) + 's'; });
 document.getElementById('gate').addEventListener('input', function() { document.getElementById('gateVal').textContent = this.value + 'ms'; });
+document.getElementById('pshoot').addEventListener('input', function() { document.getElementById('pshootVal').textContent = this.value + 'ms'; });
+document.getElementById('pdrive').addEventListener('input', function() { document.getElementById('pdriveVal').textContent = this.value + 'ms'; });
 
 pollTimer = setInterval(pollStatus, 300);
 </script>
@@ -446,14 +519,17 @@ void handleRoot() {
 }
 
 void handleTrainStart() {
-  if (server.hasArg("balls"))  totalBalls      = constrain(server.arg("balls").toInt(), 1, 100);
-  if (server.hasArg("fw"))     flywheelPct     = constrain(server.arg("fw").toInt(), 0, 100);
-  if (server.hasArg("drive"))  drivePct        = constrain(server.arg("drive").toInt(), 0, 100);
-  if (server.hasArg("burst"))  driveBurstMs    = constrain(server.arg("burst").toInt(), 200, 8000);
-  if (server.hasArg("pause"))  reversalPauseMs = constrain(server.arg("pause").toInt(), 100, 5000);
-  if (server.hasArg("gate"))   gateOpenMs      = constrain(server.arg("gate").toInt(), 100, 2000);
+  if (server.hasArg("balls"))    totalBalls       = constrain(server.arg("balls").toInt(), 1, 100);
+  if (server.hasArg("perleg"))   shotsPerLeg      = constrain(server.arg("perleg").toInt(), 1, 50);
+  if (server.hasArg("fw"))       flywheelPct      = constrain(server.arg("fw").toInt(), 0, 100);
+  if (server.hasArg("drive"))    drivePct         = constrain(server.arg("drive").toInt(), 0, 100);
+  if (server.hasArg("traverse")) traverseMs       = constrain(server.arg("traverse").toInt(), 200, 15000);
+  if (server.hasArg("gate"))     gateOpenMs       = constrain(server.arg("gate").toInt(), 100, 2000);
+  if (server.hasArg("pshoot"))   postShootPauseMs = constrain(server.arg("pshoot").toInt(), 50, 3000);
+  if (server.hasArg("pdrive"))   postDrivePauseMs = constrain(server.arg("pdrive").toInt(), 50, 5000);
 
   shotIndex = 0;
+  legShotCount = 0;
   direction = 1;
   armed = true;
   lastHeartbeat = millis();
@@ -478,11 +554,13 @@ void handleTrainStop() {
 void handleTrainStatus() {
   const char* stateStr;
   switch (trainState) {
-    case T_IDLE:   stateStr = "idle";   break;
-    case T_SPINUP: stateStr = "spinup"; break;
-    case T_FIRING: stateStr = "firing"; break;
-    case T_GAP:    stateStr = "gap";    break;
-    default:       stateStr = "idle";   break;
+    case T_IDLE:       stateStr = "idle";       break;
+    case T_SPINUP:     stateStr = "spinup";     break;
+    case T_SHOOT:      stateStr = "shoot";      break;
+    case T_POST_SHOOT: stateStr = "postshoot";  break;
+    case T_DRIVE:      stateStr = "drive";      break;
+    case T_POST_DRIVE: stateStr = "postdrive";  break;
+    default:           stateStr = "idle";       break;
   }
   int ballDisplay = (trainState == T_IDLE) ? 0 : (shotIndex + 1);
   String json = String("{\"state\":\"") + stateStr + "\",\"ball\":" + String(ballDisplay) +
