@@ -75,7 +75,7 @@ const unsigned long FLYWHEEL_SPINUP_MS = 500;  // let flywheels reach speed befo
 
 WebServer server(80);
 
-enum TrainState { T_IDLE, T_SPINUP, T_SHOOT, T_POST_SHOOT, T_DRIVE, T_POST_DRIVE };
+enum TrainState { T_IDLE, T_SPINUP, T_SHOOT, T_POST_SHOOT, T_DRIVE, T_POST_DRIVE, T_TEST_DRIVE };
 TrainState trainState = T_IDLE;
 
 int totalBalls        = DEFAULT_BALL_COUNT;
@@ -184,6 +184,18 @@ void advanceTrain() {
           legShotCount = 0;
         }
         beginShoot();
+      }
+      break;
+
+    case T_TEST_DRIVE:
+      // Drive-only calibration run - no gate, no flywheels, so it can be
+      // repeated freely while dialing in Drive Power / Traverse Time
+      // without burning through the loaded balls.
+      if (elapsed >= (unsigned long)traverseMs) {
+        setPulse(CH_DRIVE, DRIVE_NEUTRAL_US);
+        trainState = T_IDLE;
+        armed = false;
+        Serial.println("Traverse test complete");
       }
       break;
 
@@ -387,6 +399,14 @@ const char* PAGE_HTML = R"rawliteral(
   <details class="card">
     <summary>Advanced settings <span class="chev">&#8250;</span></summary>
     <div class="adv-body">
+      <div class="field" style="padding-bottom:14px; margin-bottom:14px; border-bottom:1px solid var(--border);">
+        <div class="field-label" style="margin-bottom:8px;">
+          <svg viewBox="0 0 18 18" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M2 9h14"/><path d="M12 5l4 4-4 4"/></svg>
+          <label>Traverse test</label>
+        </div>
+        <div class="hint" style="margin-top:0;">Drives forward at the Drive Power and Traverse Time set above, no gate, no flywheels. Watch how far it actually goes, adjust those two sliders, run it again - once it covers the real net length you're calibrated, and every shot uses that same speed and time to work out where it is.</div>
+        <button id="testDriveBtn" type="button" onclick="testDrive()" style="width:100%; margin-top:10px; background:var(--surface); color:var(--green); border:1.5px solid var(--green);">RUN TRAVERSE TEST</button>
+      </div>
       <div class="field">
         <div class="field-row">
           <div class="field-label"><svg viewBox="0 0 18 18" fill="none" stroke="currentColor" stroke-width="1.6"><circle cx="9" cy="9" r="6.5"/><path d="M9 5.5V9l3 2"/></svg><label>Gate open time</label></div>
@@ -426,7 +446,8 @@ const char* PAGE_HTML = R"rawliteral(
 let heartbeatTimer = null;
 let pollTimer = null;
 let running = false;
-const CONFIG_IDS = ['balls','perleg','fw','drive','traverse','gate','pshoot','pdrive','startBtn'];
+const PARAM_IDS = ['balls','perleg','fw','drive','traverse','gate','pshoot','pdrive'];
+const BUTTON_IDS = ['startBtn','testDriveBtn'];
 
 function startHeartbeat() {
   if (heartbeatTimer) return;
@@ -438,19 +459,26 @@ function stopHeartbeat() {
 }
 
 function setConfigEnabled(enabled) {
-  CONFIG_IDS.forEach(id => { document.getElementById(id).disabled = !enabled; });
+  PARAM_IDS.concat(BUTTON_IDS).forEach(id => { document.getElementById(id).disabled = !enabled; });
+}
+
+function beginRun(url) {
+  running = true;
+  setConfigEnabled(false);
+  startHeartbeat();
+  if (!pollTimer) pollTimer = setInterval(pollStatus, 300);
+  return fetch(url);
 }
 
 function startTrain() {
-  const params = CONFIG_IDS.filter(id => id !== 'startBtn')
-    .map(id => `${id}=${document.getElementById(id).value}`).join('&');
-  fetch(`/trainstart?${params}`)
-    .then(() => {
-      running = true;
-      setConfigEnabled(false);
-      startHeartbeat();
-      if (!pollTimer) pollTimer = setInterval(pollStatus, 300);
-    });
+  const params = PARAM_IDS.map(id => `${id}=${document.getElementById(id).value}`).join('&');
+  beginRun(`/trainstart?${params}`);
+}
+
+function testDrive() {
+  const drive = document.getElementById('drive').value;
+  const traverse = document.getElementById('traverse').value;
+  beginRun(`/testdrive?drive=${drive}&traverse=${traverse}`);
 }
 
 function stopTrain() {
@@ -463,8 +491,8 @@ function stopTrain() {
 
 const FWD_ARROW = '<path d="M2 9h13"/><path d="M11 5l4 4-4 4"/>';
 const REV_ARROW = '<path d="M16 9H3"/><path d="M7 5 3 9l4 4"/>';
-const ACTIVE_STATES = ['shoot', 'drive'];
-const STATUS_LABELS = { spinup: 'SPINNING UP', shoot: 'FIRING', postshoot: 'COOLDOWN', drive: 'DRIVING', postdrive: 'COOLDOWN' };
+const ACTIVE_STATES = ['shoot', 'drive', 'testdrive'];
+const STATUS_LABELS = { spinup: 'SPINNING UP', shoot: 'FIRING', postshoot: 'COOLDOWN', drive: 'DRIVING', postdrive: 'COOLDOWN', testdrive: 'TEST DRIVE' };
 
 function pollStatus() {
   fetch('/trainstatus').then(r => r.json()).then(s => {
@@ -545,6 +573,22 @@ void handleTrainStart() {
   server.send(200, "text/plain", "started");
 }
 
+void handleTestDrive() {
+  if (server.hasArg("drive"))    drivePct   = constrain(server.arg("drive").toInt(), 0, 100);
+  if (server.hasArg("traverse")) traverseMs = constrain(server.arg("traverse").toInt(), 200, 15000);
+
+  direction = 1;  // test always drives forward - avoid showing a stale REVERSE badge left over from the last real run
+  armed = true;
+  lastHeartbeat = millis();
+
+  int us = DRIVE_NEUTRAL_US + (long)drivePct * DRIVE_MAX_DELTA_US / 100;  // always tests forward
+  setPulse(CH_DRIVE, us);
+  trainState = T_TEST_DRIVE;
+  phaseStart = millis();
+  Serial.println("Traverse test started");
+  server.send(200, "text/plain", "testing");
+}
+
 void handleTrainStop() {
   stopTrain();
   Serial.println("Train run stopped");
@@ -560,11 +604,16 @@ void handleTrainStatus() {
     case T_POST_SHOOT: stateStr = "postshoot";  break;
     case T_DRIVE:      stateStr = "drive";      break;
     case T_POST_DRIVE: stateStr = "postdrive";  break;
+    case T_TEST_DRIVE: stateStr = "testdrive";  break;
     default:           stateStr = "idle";       break;
   }
-  int ballDisplay = (trainState == T_IDLE) ? 0 : (shotIndex + 1);
+  // Test drive doesn't touch the ball sequence at all - report 0/0 rather
+  // than whatever's left over from the last real run.
+  bool isTest = (trainState == T_TEST_DRIVE);
+  int ballDisplay = (trainState == T_IDLE || isTest) ? 0 : (shotIndex + 1);
+  int totalDisplay = isTest ? 0 : totalBalls;
   String json = String("{\"state\":\"") + stateStr + "\",\"ball\":" + String(ballDisplay) +
-                ",\"total\":" + String(totalBalls) + ",\"direction\":" + String(direction) + "}";
+                ",\"total\":" + String(totalDisplay) + ",\"direction\":" + String(direction) + "}";
   server.send(200, "application/json", json);
 }
 
@@ -591,6 +640,7 @@ void setup() {
 
   server.on("/", handleRoot);
   server.on("/trainstart", handleTrainStart);
+  server.on("/testdrive", handleTestDrive);
   server.on("/trainstop", handleTrainStop);
   server.on("/trainstatus", handleTrainStatus);
   server.on("/heartbeat", handleHeartbeat);
