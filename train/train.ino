@@ -268,6 +268,9 @@ void advanceTrain() {
           setPulse(CH_DRIVE, us);
           trainState = T_DRIVE;
           phaseStart = millis();
+          Serial.print("Drive segment start: dir="); Serial.print(direction);
+          Serial.print(" pulse="); Serial.print(us);
+          Serial.print("us target="); Serial.print(segmentDriveMs()); Serial.println("ms");
         }
       }
       break;
@@ -286,6 +289,7 @@ void advanceTrain() {
         setPulse(CH_DRIVE, us);
         trainState = T_DIR_ARM;
         phaseStart = millis();
+        Serial.print("Arm-tap pulse: "); Serial.print(us); Serial.println("us");
       }
       break;
 
@@ -305,6 +309,9 @@ void advanceTrain() {
         setPulse(CH_DRIVE, us);
         trainState = T_DRIVE;
         phaseStart = millis();
+        Serial.print("Drive segment start: dir="); Serial.print(direction);
+        Serial.print(" pulse="); Serial.print(us);
+        Serial.print("us target="); Serial.print(segmentDriveMs()); Serial.println("ms");
       }
       break;
 
@@ -315,6 +322,8 @@ void advanceTrain() {
         setPulse(CH_DRIVE, brakeUs);
         trainState = T_BRAKE;
         phaseStart = millis();
+        Serial.print("Drive segment done, elapsed="); Serial.print(elapsed);
+        Serial.print("ms, braking with "); Serial.print(brakeUs); Serial.println("us");
       }
       break;
 
@@ -323,6 +332,7 @@ void advanceTrain() {
         setPulse(CH_DRIVE, DRIVE_NEUTRAL_US);
         trainState = T_POST_DRIVE;
         phaseStart = millis();
+        Serial.println("Brake done, drive channel neutral");
       }
       break;
 
