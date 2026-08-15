@@ -82,6 +82,12 @@ const int DEFAULT_POST_DRIVE_PAUSE_MS  = 500;  // buggy comes to a full stop bef
 // confirmed against the QuicRun 1060 datasheet, tune if it's still wrong.
 const int DEFAULT_DIR_SETTLE_MS = 500;
 
+// Extra pause specifically at a pass boundary (on top of the normal
+// post-shoot pause), between the last shot of one pass and the first shot
+// of the next - they land at the same physical spot with no drive between
+// them, so this is the only thing giving that transition breathing room.
+const int DEFAULT_PASS_CHANGE_PAUSE_MS = 1000;
+
 // Balls are constantly rolling in the storage net, so the gate has to open
 // and close fast enough that a second ball can't slip through behind the
 // first one. Keep gate open time + the post-shoot pause comfortably under
@@ -92,7 +98,7 @@ const unsigned long FLYWHEEL_SPINUP_MS = 500;  // let flywheels reach speed befo
 
 WebServer server(80);
 
-enum TrainState { T_IDLE, T_SPINUP, T_SHOOT, T_POST_SHOOT, T_DRIVE, T_POST_DRIVE, T_DIR_SETTLE, T_TEST_DRIVE, T_TEST_PAUSE };
+enum TrainState { T_IDLE, T_SPINUP, T_SHOOT, T_POST_SHOOT, T_PASS_PAUSE, T_DRIVE, T_POST_DRIVE, T_DIR_SETTLE, T_TEST_DRIVE, T_TEST_PAUSE };
 TrainState trainState = T_IDLE;
 
 int totalBalls        = DEFAULT_BALL_COUNT;
@@ -102,6 +108,7 @@ int drivePct           = DEFAULT_DRIVE_PCT;
 int traverseMs         = DEFAULT_TRAVERSE_MS;
 int postDrivePauseMs    = DEFAULT_POST_DRIVE_PAUSE_MS;
 int dirSettleMs         = DEFAULT_DIR_SETTLE_MS;
+int passChangePauseMs   = DEFAULT_PASS_CHANGE_PAUSE_MS;
 // 0 = both flywheels equal, 1 = "spin right" (right motor full, left motor
 // 50 points slower), -1 = "spin left" (mirrored). Which physical direction
 // the ball actually curves toward is unverified - test both and see, flip
@@ -223,12 +230,15 @@ void advanceTrain() {
         bool passComplete = (legShotCount >= shotsPerLeg);
         if (passComplete && shotsPerLeg >= 2) {
           // The shot spacing already carried the buggy to the far end -
-          // flip and fire the next pass's first shot right here, no drive.
+          // flip, then pause before the next pass's first shot fires right
+          // here (no drive happens between them, so this pause is the only
+          // breathing room this transition gets).
           direction = -direction;
           legShotCount = 0;
           directionJustFlipped = true;
           Serial.println("Pass complete - reversing direction");
-          beginShoot();
+          trainState = T_PASS_PAUSE;
+          phaseStart = millis();
         } else if (directionJustFlipped) {
           // First drive segment since a direction flip - hold neutral
           // explicitly before reversing, see DEFAULT_DIR_SETTLE_MS.
@@ -246,6 +256,12 @@ void advanceTrain() {
           trainState = T_DRIVE;
           phaseStart = millis();
         }
+      }
+      break;
+
+    case T_PASS_PAUSE:
+      if (elapsed >= (unsigned long)passChangePauseMs) {
+        beginShoot();
       }
       break;
 
@@ -551,6 +567,15 @@ const char* PAGE_HTML = R"rawliteral(
         <input type="range" id="dirsettle" min="100" max="3000" step="50" value="500">
         <div class="hint">Explicit neutral hold before the first drive segment in a new direction - some ESCs treat a reverse command right after forward as a brake unless it sees neutral first.</div>
       </div>
+
+      <div class="field" style="margin-bottom:0;">
+        <div class="field-row">
+          <div class="field-label"><svg viewBox="0 0 18 18" fill="none" stroke="currentColor" stroke-width="1.6"><circle cx="9" cy="9" r="6.5"/><path d="M9 5.5V9l3 2"/></svg><label>Pass change pause</label></div>
+          <span class="val" id="passpauseVal">1000ms</span>
+        </div>
+        <input type="range" id="passpause" min="200" max="3000" step="50" value="1000">
+        <div class="hint">Extra pause between the last shot of a pass and the first shot of the next - they land at the same spot with no drive between them.</div>
+      </div>
     </div>
   </details>
 
@@ -565,7 +590,7 @@ let heartbeatTimer = null;
 let pollTimer = null;
 let running = false;
 let spinMode = 0;
-const PARAM_IDS = ['balls','perleg','fw','drive','traverse','pdrive','dirsettle'];
+const PARAM_IDS = ['balls','perleg','fw','drive','traverse','pdrive','dirsettle','passpause'];
 const BUTTON_IDS = ['startBtn','testDriveBtn'];
 
 function startHeartbeat() {
@@ -619,7 +644,7 @@ function stopTrain() {
 const FWD_ARROW = '<path d="M2 9h13"/><path d="M11 5l4 4-4 4"/>';
 const REV_ARROW = '<path d="M16 9H3"/><path d="M7 5 3 9l4 4"/>';
 const ACTIVE_STATES = ['shoot', 'drive', 'testdrive'];
-const STATUS_LABELS = { spinup: 'SPINNING UP', shoot: 'FIRING', postshoot: 'COOLDOWN', drive: 'DRIVING', postdrive: 'COOLDOWN', dirsettle: 'SETTLING', testdrive: 'TEST DRIVE' };
+const STATUS_LABELS = { spinup: 'SPINNING UP', shoot: 'FIRING', postshoot: 'COOLDOWN', passpause: 'PASS CHANGE', drive: 'DRIVING', postdrive: 'COOLDOWN', dirsettle: 'SETTLING', testdrive: 'TEST DRIVE' };
 
 function pollStatus() {
   fetch('/trainstatus').then(r => r.json()).then(s => {
@@ -661,6 +686,7 @@ document.getElementById('drive').addEventListener('input', function() { document
 document.getElementById('traverse').addEventListener('input', function() { document.getElementById('traverseVal').textContent = (this.value / 1000).toFixed(1) + 's'; });
 document.getElementById('pdrive').addEventListener('input', function() { document.getElementById('pdriveVal').textContent = this.value + 'ms'; });
 document.getElementById('dirsettle').addEventListener('input', function() { document.getElementById('dirsettleVal').textContent = this.value + 'ms'; });
+document.getElementById('passpause').addEventListener('input', function() { document.getElementById('passpauseVal').textContent = this.value + 'ms'; });
 
 pollTimer = setInterval(pollStatus, 300);
 </script>
@@ -680,6 +706,7 @@ void handleTrainStart() {
   if (server.hasArg("traverse")) traverseMs       = constrain(server.arg("traverse").toInt(), 200, 15000);
   if (server.hasArg("pdrive"))   postDrivePauseMs = constrain(server.arg("pdrive").toInt(), 50, 5000);
   if (server.hasArg("dirsettle")) dirSettleMs     = constrain(server.arg("dirsettle").toInt(), 100, 3000);
+  if (server.hasArg("passpause")) passChangePauseMs = constrain(server.arg("passpause").toInt(), 100, 5000);
   if (server.hasArg("spin"))     spinMode         = constrain(server.arg("spin").toInt(), -1, 1);
 
   shotIndex = 0;
@@ -728,6 +755,7 @@ void handleTrainStatus() {
     case T_SPINUP:     stateStr = "spinup";     break;
     case T_SHOOT:      stateStr = "shoot";      break;
     case T_POST_SHOOT: stateStr = "postshoot";  break;
+    case T_PASS_PAUSE: stateStr = "passpause";  break;
     case T_DRIVE:       stateStr = "drive";      break;
     case T_POST_DRIVE:  stateStr = "postdrive";  break;
     case T_DIR_SETTLE:  stateStr = "dirsettle";  break;
