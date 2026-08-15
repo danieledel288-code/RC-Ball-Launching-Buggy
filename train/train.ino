@@ -75,10 +75,23 @@ const int DEFAULT_REVERSE_PCT   = 30;
 // this divided by "balls per pass," computed automatically.
 const int DEFAULT_TRAVERSE_MS = 6000;
 
-// Fixed, not user-adjustable - both tested well and didn't need tuning,
+// Fixed, not user-adjustable - all tested well and didn't need tuning,
 // so they're not worth sliders on screen.
 const int GATE_OPEN_MS        = 500;  // how long the gate stays open per shot
 const int POST_SHOOT_PAUSE_MS = 300;  // gate finishes closing before the drive segment starts
+
+// Direction-change double-tap. Field test 2026-08-16: with this removed, a
+// plain single reverse pulse right after a forward segment silently didn't
+// move the buggy at all (Traverse Test's own Forward/Reverse toggle drove
+// reverse fine on its own, because it never transitions FROM forward within
+// the same session - only a real in-run flip hits this). Consistent with
+// bidirectional ESCs that read the first reverse command after forward as
+// a brake/arm signal, not real reverse - a second reverse command, with a
+// neutral gap, is what actually drives backward. Re-added after being
+// pulled out entirely; kept fixed rather than sliders since the values
+// already tested fine and don't need to be visible/tunable day to day.
+const int DIR_SETTLE_MS = 500;  // neutral hold on both sides of the arm-tap
+const int DIR_ARM_MS    = 300;  // duration of the arm-tap pulse (read as brake, not real motion)
 
 // --- Advanced defaults - tucked under the Advanced Settings disclosure ---
 const int DEFAULT_POST_DRIVE_PAUSE_MS  = 500;  // buggy comes to a full stop before the next gate opens
@@ -102,7 +115,7 @@ const unsigned long FLYWHEEL_SPINUP_MS = 500;  // let flywheels reach speed befo
 
 WebServer server(80);
 
-enum TrainState { T_IDLE, T_SPINUP, T_SHOOT, T_POST_SHOOT, T_PASS_PAUSE, T_DRIVE, T_POST_DRIVE, T_TEST_DRIVE, T_TEST_PAUSE };
+enum TrainState { T_IDLE, T_SPINUP, T_SHOOT, T_POST_SHOOT, T_PASS_PAUSE, T_DIR_SETTLE, T_DIR_ARM, T_DIR_RELEASE, T_DRIVE, T_POST_DRIVE, T_TEST_DRIVE, T_TEST_PAUSE };
 TrainState trainState = T_IDLE;
 
 int totalBalls        = DEFAULT_BALL_COUNT;
@@ -123,6 +136,7 @@ int shotIndex   = 0;   // total shots fired so far, 0-based
 int legShotCount = 0;  // shots fired within the current pass, resets at each leg boundary
 int direction   = 1;   // 1 = forward, -1 = reverse, flips once a full pass completes
 bool driveEndsLeg = false;  // set when the upcoming drive segment is the one that completes the pass (only true for balls-per-pass == 1)
+bool directionJustFlipped = false;  // consumed by the next drive segment to decide whether it needs the settle/arm-tap first
 int testSegmentsRemaining = 0;  // counts down during a traverse test, mirrors a real leg's segment count
 unsigned long phaseStart = 0;
 
@@ -248,8 +262,17 @@ void advanceTrain() {
           // breathing room this transition gets).
           direction = -direction;
           legShotCount = 0;
+          directionJustFlipped = true;
           Serial.println("Pass complete - reversing direction");
           trainState = T_PASS_PAUSE;
+          phaseStart = millis();
+        } else if (directionJustFlipped) {
+          // First drive segment since a direction flip - settle/arm-tap
+          // before the real pulse, see DIR_SETTLE_MS/DIR_ARM_MS.
+          driveEndsLeg = passComplete;
+          directionJustFlipped = false;
+          setPulse(CH_DRIVE, DRIVE_NEUTRAL_US);
+          trainState = T_DIR_SETTLE;
           phaseStart = millis();
         } else {
           // Either more shots remain in this pass, or (balls-per-pass == 1)
@@ -272,6 +295,39 @@ void advanceTrain() {
       }
       break;
 
+    case T_DIR_SETTLE:
+      if (elapsed >= (unsigned long)DIR_SETTLE_MS) {
+        // Arm-tap: expected to be read as a brake, not real motion, since
+        // the ESC's last direction was the opposite of this one.
+        int us = drivePulseFor(direction);
+        setPulse(CH_DRIVE, us);
+        trainState = T_DIR_ARM;
+        phaseStart = millis();
+      }
+      break;
+
+    case T_DIR_ARM:
+      if (elapsed >= (unsigned long)DIR_ARM_MS) {
+        setPulse(CH_DRIVE, DRIVE_NEUTRAL_US);
+        trainState = T_DIR_RELEASE;
+        phaseStart = millis();
+      }
+      break;
+
+    case T_DIR_RELEASE:
+      if (elapsed >= (unsigned long)DIR_SETTLE_MS) {
+        // Second command in this direction - the one that should actually
+        // drive, now that it's armed.
+        int us = drivePulseFor(direction);
+        setPulse(CH_DRIVE, us);
+        trainState = T_DRIVE;
+        phaseStart = millis();
+        Serial.print("Drive segment start: dir="); Serial.print(direction);
+        Serial.print(" pulse="); Serial.print(us);
+        Serial.print("us target="); Serial.print(segmentDriveMs()); Serial.println("ms");
+      }
+      break;
+
     case T_DRIVE:
       if (elapsed >= (unsigned long)segmentDriveMs()) {
         setPulse(CH_DRIVE, DRIVE_NEUTRAL_US);
@@ -288,6 +344,7 @@ void advanceTrain() {
           direction = -direction;
           legShotCount = 0;
           driveEndsLeg = false;
+          directionJustFlipped = true;
           Serial.println("Pass complete - reversing direction");
         }
         beginShoot();
@@ -433,7 +490,9 @@ const char* PAGE_HTML = R"rawliteral(
 
   .spin-row { display: flex; gap: 8px; margin-bottom: 4px; }
   .spin-opt {
+    -webkit-appearance: none; appearance: none;
     flex: 1; padding: 10px 4px; font-size: 12.5px; font-weight: 700; letter-spacing: 0;
+    line-height: normal; margin: 0;
     border-radius: 999px; border: 1.5px solid var(--border); background: var(--surface);
     color: var(--ink-soft); cursor: pointer; transition: transform 0.1s ease-out;
     display: flex; align-items: center; justify-content: center; white-space: nowrap;
@@ -718,6 +777,7 @@ void handleTrainStart() {
   legShotCount = 0;
   direction = 1;
   driveEndsLeg = false;
+  directionJustFlipped = false;
   armed = true;
   lastHeartbeat = millis();
 
@@ -762,6 +822,11 @@ void handleTrainStatus() {
     case T_SHOOT:      stateStr = "shoot";      break;
     case T_POST_SHOOT: stateStr = "postshoot";  break;
     case T_PASS_PAUSE: stateStr = "passpause";  break;
+    // Settle/arm-tap reuse existing status labels rather than adding new
+    // ones - not meant to be visibly distinct in the UI, just functional.
+    case T_DIR_SETTLE:  stateStr = "postdrive";  break;
+    case T_DIR_ARM:      stateStr = "drive";      break;
+    case T_DIR_RELEASE:  stateStr = "postdrive";  break;
     case T_DRIVE:      stateStr = "drive";      break;
     case T_POST_DRIVE: stateStr = "postdrive";  break;
     case T_TEST_DRIVE:
