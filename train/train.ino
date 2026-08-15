@@ -85,6 +85,14 @@ const int DEFAULT_POST_DRIVE_PAUSE_MS  = 500;  // buggy comes to a full stop bef
 const int DEFAULT_DIR_SETTLE_MS = 500;
 const int DEFAULT_DIR_ARM_MS    = 300;  // duration of the arm-tap reverse pulse
 
+// A drive segment ending in plain neutral just stops sending power - the
+// buggy coasts on its own momentum until friction stops it, which is how
+// it smashed into the wall it started from after a full-speed reverse run.
+// Reuses the same trick the reverse arm-tap uses: this ESC reads an
+// opposite-direction pulse as a brake, so pulse the opposite direction
+// briefly at the end of every segment instead of just cutting to neutral.
+const int DEFAULT_BRAKE_MS = 200;
+
 // Extra pause specifically at a pass boundary (on top of the normal
 // post-shoot pause), between the last shot of one pass and the first shot
 // of the next - they land at the same physical spot with no drive between
@@ -101,7 +109,7 @@ const unsigned long FLYWHEEL_SPINUP_MS = 500;  // let flywheels reach speed befo
 
 WebServer server(80);
 
-enum TrainState { T_IDLE, T_SPINUP, T_SHOOT, T_POST_SHOOT, T_PASS_PAUSE, T_DRIVE, T_POST_DRIVE, T_DIR_SETTLE, T_DIR_ARM, T_DIR_RELEASE, T_TEST_DRIVE, T_TEST_PAUSE };
+enum TrainState { T_IDLE, T_SPINUP, T_SHOOT, T_POST_SHOOT, T_PASS_PAUSE, T_DRIVE, T_BRAKE, T_POST_DRIVE, T_DIR_SETTLE, T_DIR_ARM, T_DIR_RELEASE, T_TEST_DRIVE, T_TEST_BRAKE, T_TEST_PAUSE };
 TrainState trainState = T_IDLE;
 
 int totalBalls        = DEFAULT_BALL_COUNT;
@@ -112,6 +120,7 @@ int traverseMs         = DEFAULT_TRAVERSE_MS;
 int postDrivePauseMs    = DEFAULT_POST_DRIVE_PAUSE_MS;
 int dirSettleMs         = DEFAULT_DIR_SETTLE_MS;
 int dirArmMs            = DEFAULT_DIR_ARM_MS;
+int brakeMs             = DEFAULT_BRAKE_MS;
 int passChangePauseMs   = DEFAULT_PASS_CHANGE_PAUSE_MS;
 // 0 = both flywheels equal, 1 = "spin right" (right motor full, left motor
 // 50 points slower), -1 = "spin left" (mirrored). Which physical direction
@@ -301,6 +310,16 @@ void advanceTrain() {
 
     case T_DRIVE:
       if (elapsed >= (unsigned long)segmentDriveMs()) {
+        // Active brake instead of coasting to a stop - see DEFAULT_BRAKE_MS.
+        int brakeUs = DRIVE_NEUTRAL_US + (long)(-direction) * drivePct * DRIVE_MAX_DELTA_US / 100;
+        setPulse(CH_DRIVE, brakeUs);
+        trainState = T_BRAKE;
+        phaseStart = millis();
+      }
+      break;
+
+    case T_BRAKE:
+      if (elapsed >= (unsigned long)brakeMs) {
         setPulse(CH_DRIVE, DRIVE_NEUTRAL_US);
         trainState = T_POST_DRIVE;
         phaseStart = millis();
@@ -329,8 +348,19 @@ void advanceTrain() {
       // dead stop cover noticeably less distance per second of drive time
       // than one continuous run at the same total time - a continuous test
       // would calibrate a Traverse Time that then falls short in the real,
-      // segmented run.
+      // segmented run. Brakes the same way a real segment does (see
+      // T_BRAKE) so the test's total travel actually matches what the real
+      // run will cover, coast-out included.
       if (elapsed >= (unsigned long)segmentDriveMs()) {
+        int brakeUs = DRIVE_NEUTRAL_US - (long)drivePct * DRIVE_MAX_DELTA_US / 100;  // opposite of the forward-only test pulse
+        setPulse(CH_DRIVE, brakeUs);
+        trainState = T_TEST_BRAKE;
+        phaseStart = millis();
+      }
+      break;
+
+    case T_TEST_BRAKE:
+      if (elapsed >= (unsigned long)brakeMs) {
         setPulse(CH_DRIVE, DRIVE_NEUTRAL_US);
         testSegmentsRemaining--;
         if (testSegmentsRemaining <= 0) {
@@ -586,6 +616,15 @@ const char* PAGE_HTML = R"rawliteral(
 
       <div class="field">
         <div class="field-row">
+          <div class="field-label"><svg viewBox="0 0 18 18" fill="none" stroke="currentColor" stroke-width="1.6"><circle cx="9" cy="9" r="6.5"/><path d="M9 5.5V9l3 2"/></svg><label>Brake pulse</label></div>
+          <span class="val" id="brakeVal">200ms</span>
+        </div>
+        <input type="range" id="brake" min="0" max="800" step="25" value="200">
+        <div class="hint">Opposite-direction pulse at the end of every drive segment, instead of just cutting to neutral and coasting. Set to 0 to disable if it turns out too aggressive.</div>
+      </div>
+
+      <div class="field">
+        <div class="field-row">
           <div class="field-label"><svg viewBox="0 0 18 18" fill="none" stroke="currentColor" stroke-width="1.6"><circle cx="9" cy="9" r="6.5"/><path d="M9 5.5V9l3 2"/></svg><label>Direction settle</label></div>
           <span class="val" id="dirsettleVal">500ms</span>
         </div>
@@ -624,7 +663,7 @@ let heartbeatTimer = null;
 let pollTimer = null;
 let running = false;
 let spinMode = 0;
-const PARAM_IDS = ['balls','perleg','fw','drive','traverse','pdrive','dirsettle','dirarm','passpause'];
+const PARAM_IDS = ['balls','perleg','fw','drive','traverse','pdrive','brake','dirsettle','dirarm','passpause'];
 const BUTTON_IDS = ['startBtn','testDriveBtn'];
 
 function startHeartbeat() {
@@ -677,8 +716,8 @@ function stopTrain() {
 
 const FWD_ARROW = '<path d="M2 9h13"/><path d="M11 5l4 4-4 4"/>';
 const REV_ARROW = '<path d="M16 9H3"/><path d="M7 5 3 9l4 4"/>';
-const ACTIVE_STATES = ['shoot', 'drive', 'dirarm', 'testdrive'];
-const STATUS_LABELS = { spinup: 'SPINNING UP', shoot: 'FIRING', postshoot: 'COOLDOWN', passpause: 'PASS CHANGE', drive: 'DRIVING', postdrive: 'COOLDOWN', dirsettle: 'SETTLING', dirarm: 'ARMING', testdrive: 'TEST DRIVE' };
+const ACTIVE_STATES = ['shoot', 'drive', 'brake', 'dirarm', 'testdrive'];
+const STATUS_LABELS = { spinup: 'SPINNING UP', shoot: 'FIRING', postshoot: 'COOLDOWN', passpause: 'PASS CHANGE', drive: 'DRIVING', brake: 'BRAKING', postdrive: 'COOLDOWN', dirsettle: 'SETTLING', dirarm: 'ARMING', testdrive: 'TEST DRIVE' };
 
 function pollStatus() {
   fetch('/trainstatus').then(r => r.json()).then(s => {
@@ -721,6 +760,7 @@ document.getElementById('traverse').addEventListener('input', function() { docum
 document.getElementById('pdrive').addEventListener('input', function() { document.getElementById('pdriveVal').textContent = this.value + 'ms'; });
 document.getElementById('dirsettle').addEventListener('input', function() { document.getElementById('dirsettleVal').textContent = this.value + 'ms'; });
 document.getElementById('dirarm').addEventListener('input', function() { document.getElementById('dirarmVal').textContent = this.value + 'ms'; });
+document.getElementById('brake').addEventListener('input', function() { document.getElementById('brakeVal').textContent = this.value + 'ms'; });
 document.getElementById('passpause').addEventListener('input', function() { document.getElementById('passpauseVal').textContent = this.value + 'ms'; });
 
 pollTimer = setInterval(pollStatus, 300);
@@ -742,6 +782,7 @@ void handleTrainStart() {
   if (server.hasArg("pdrive"))   postDrivePauseMs = constrain(server.arg("pdrive").toInt(), 50, 5000);
   if (server.hasArg("dirsettle")) dirSettleMs     = constrain(server.arg("dirsettle").toInt(), 100, 3000);
   if (server.hasArg("dirarm"))    dirArmMs        = constrain(server.arg("dirarm").toInt(), 100, 1500);
+  if (server.hasArg("brake"))     brakeMs         = constrain(server.arg("brake").toInt(), 0, 800);
   if (server.hasArg("passpause")) passChangePauseMs = constrain(server.arg("passpause").toInt(), 100, 5000);
   if (server.hasArg("spin"))     spinMode         = constrain(server.arg("spin").toInt(), -1, 1);
 
@@ -793,17 +834,19 @@ void handleTrainStatus() {
     case T_POST_SHOOT: stateStr = "postshoot";  break;
     case T_PASS_PAUSE: stateStr = "passpause";  break;
     case T_DRIVE:       stateStr = "drive";      break;
+    case T_BRAKE:       stateStr = "brake";      break;
     case T_POST_DRIVE:  stateStr = "postdrive";  break;
     case T_DIR_SETTLE:  stateStr = "dirsettle";  break;
     case T_DIR_ARM:     stateStr = "dirarm";     break;
     case T_DIR_RELEASE: stateStr = "dirsettle";  break;
     case T_TEST_DRIVE:
+    case T_TEST_BRAKE:
     case T_TEST_PAUSE: stateStr = "testdrive";  break;
     default:           stateStr = "idle";       break;
   }
   // Test actions don't touch the ball sequence at all - report 0/0 rather
   // than whatever's left over from the last real run.
-  bool isTest = (trainState == T_TEST_DRIVE || trainState == T_TEST_PAUSE);
+  bool isTest = (trainState == T_TEST_DRIVE || trainState == T_TEST_BRAKE || trainState == T_TEST_PAUSE);
   int ballDisplay = (trainState == T_IDLE || isTest) ? 0 : (shotIndex + 1);
   int totalDisplay = isTest ? 0 : totalBalls;
   String json = String("{\"state\":\"") + stateStr + "\",\"ball\":" + String(ballDisplay) +
