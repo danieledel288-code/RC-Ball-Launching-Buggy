@@ -185,8 +185,10 @@ void beginShoot() {
   phaseStart = millis();
 }
 
+int testDirection = 1;  // 1 = forward, -1 = reverse - which way the Traverse Test drives
+
 void beginTestSegment() {
-  int us = DRIVE_NEUTRAL_US + (long)drivePct * DRIVE_MAX_DELTA_US / 100;  // test always drives forward
+  int us = DRIVE_NEUTRAL_US + (long)testDirection * drivePct * DRIVE_MAX_DELTA_US / 100;
   setPulse(CH_DRIVE, us);
   trainState = T_TEST_DRIVE;
   phaseStart = millis();
@@ -362,7 +364,7 @@ void advanceTrain() {
       // T_BRAKE) so the test's total travel actually matches what the real
       // run will cover, coast-out included.
       if (elapsed >= (unsigned long)segmentDriveMs()) {
-        int brakeUs = DRIVE_NEUTRAL_US - (long)drivePct * DRIVE_MAX_DELTA_US / 100;  // opposite of the forward-only test pulse
+        int brakeUs = DRIVE_NEUTRAL_US + (long)(-testDirection) * drivePct * DRIVE_MAX_DELTA_US / 100;
         setPulse(CH_DRIVE, brakeUs);
         trainState = T_TEST_BRAKE;
         phaseStart = millis();
@@ -612,6 +614,11 @@ const char* PAGE_HTML = R"rawliteral(
           <label>Traverse test</label>
         </div>
         <div class="hint" style="margin-top:0;">Runs the same number of stop-start segments as "balls per pass," at the Drive Power and Traverse Time set above - no gate, no flywheels. This matches the real run's repeated-stop behavior, so it may cover less distance than one continuous drive would. Watch how far it actually goes, adjust the two sliders above, run it again - once it covers the real net length you're calibrated, and every shot uses that same speed and time to work out where it is.</div>
+        <div class="spin-row" style="margin-top:10px;">
+          <button type="button" class="spin-opt dir-opt selected" data-dir="1" onclick="setTestDir(1,this)">Forward</button>
+          <button type="button" class="spin-opt dir-opt" data-dir="-1" onclick="setTestDir(-1,this)">Reverse</button>
+        </div>
+        <div class="hint">Test reverse specifically if forward and reverse feel different at the same settings - some ESCs respond very differently to the same commanded power depending on direction.</div>
         <button id="testDriveBtn" type="button" onclick="testDrive()" style="width:100%; margin-top:10px; background:var(--surface); color:var(--green); border:1.5px solid var(--green);">RUN TRAVERSE TEST</button>
       </div>
 
@@ -692,7 +699,14 @@ function setConfigEnabled(enabled) {
 
 function setSpin(val, btn) {
   spinMode = val;
-  document.querySelectorAll('.spin-opt').forEach(b => b.classList.remove('selected'));
+  document.querySelectorAll('.spin-opt:not(.dir-opt)').forEach(b => b.classList.remove('selected'));
+  btn.classList.add('selected');
+}
+
+let testDirection = 1;
+function setTestDir(val, btn) {
+  testDirection = val;
+  document.querySelectorAll('.dir-opt').forEach(b => b.classList.remove('selected'));
   btn.classList.add('selected');
 }
 
@@ -713,7 +727,7 @@ function testDrive() {
   const drive = document.getElementById('drive').value;
   const traverse = document.getElementById('traverse').value;
   const perleg = document.getElementById('perleg').value;
-  beginRun(`/testdrive?drive=${drive}&traverse=${traverse}&perleg=${perleg}`);
+  beginRun(`/testdrive?drive=${drive}&traverse=${traverse}&perleg=${perleg}&dir=${testDirection}`);
 }
 
 function stopTrain() {
@@ -818,8 +832,9 @@ void handleTestDrive() {
   if (server.hasArg("drive"))    drivePct    = constrain(server.arg("drive").toInt(), 0, 100);
   if (server.hasArg("traverse")) traverseMs  = constrain(server.arg("traverse").toInt(), 200, 15000);
   if (server.hasArg("perleg"))   shotsPerLeg = constrain(server.arg("perleg").toInt(), 1, 50);
+  if (server.hasArg("dir"))      testDirection = (server.arg("dir").toInt() < 0) ? -1 : 1;
 
-  direction = 1;  // test always drives forward - avoid showing a stale REVERSE badge left over from the last real run
+  direction = testDirection;  // so the UI direction badge matches what the test actually drives
   armed = true;
   lastHeartbeat = millis();
 
