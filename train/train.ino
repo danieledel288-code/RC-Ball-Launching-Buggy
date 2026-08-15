@@ -55,7 +55,17 @@ const int DEFAULT_BALL_COUNT    = 4;     // total balls fired across the whole r
 const int DEFAULT_SHOTS_PER_LEG = 4;     // balls fired per one-way pass across the net
                                           // (4 balls + 4 per pass = one pass, no reversal, by default)
 const int DEFAULT_FLYWHEEL_PCT  = 75;    // flywheel power, 0-100
-const int DEFAULT_DRIVE_PCT     = 60;    // drive power, 0-100 (of the +/-300us envelope)
+
+// Field test 2026-08-16: reverse runs roughly twice as fast as forward at
+// the same commanded percent on this ESC - confirmed by comparing identical
+// pulse values in each direction. Forward and reverse now have separate
+// speed sliders instead of one shared value. Mins are floors below which
+// the motor doesn't reliably move at all; defaults are picked so the two
+// directions feel roughly matched in real speed (60% forward ~= 30% reverse).
+const int FORWARD_MIN_PCT       = 40;
+const int DEFAULT_FORWARD_PCT   = 60;
+const int REVERSE_MIN_PCT       = 30;
+const int DEFAULT_REVERSE_PCT   = 30;
 
 // Time to drive the FULL net length at the configured drive power, in ms.
 // This is not measured yet - it's a placeholder. Bench test it: run Drive
@@ -73,30 +83,13 @@ const int POST_SHOOT_PAUSE_MS = 300;  // gate finishes closing before the drive 
 // --- Advanced defaults - tucked under the Advanced Settings disclosure ---
 const int DEFAULT_POST_DRIVE_PAUSE_MS  = 500;  // buggy comes to a full stop before the next gate opens
 
-// Real field test (2026-08-15) found the buggy still wasn't reversing even
-// after a plain neutral hold before the reverse pulse. Revised theory: many
-// bidirectional car ESCs (QuicRun 1060 likely included, not confirmed
-// against its datasheet) use a double-tap to arm reverse - the first
-// reverse command after forward motion is read as a brake, not a real
-// reverse, and only a SECOND reverse command (with a neutral gap in
-// between) actually drives backward. So the full sequence on a direction
-// flip is now: neutral hold -> brief reverse "tap" (eaten as brake/arm) ->
-// neutral again -> real reverse pulse (this is what starts driving).
-const int DEFAULT_DIR_SETTLE_MS = 500;
-const int DEFAULT_DIR_ARM_MS    = 300;  // duration of the arm-tap reverse pulse
-
-// A drive segment ending in plain neutral just stops sending power - the
-// buggy coasts on its own momentum until friction stops it, which is how
-// it smashed into the wall it started from after a full-speed reverse run.
-// Reuses the same trick the reverse arm-tap uses: this ESC reads an
-// opposite-direction pulse as a brake, so pulse the opposite direction
-// briefly at the end of every segment instead of just cutting to neutral.
-const int DEFAULT_BRAKE_MS = 200;
-
 // Extra pause specifically at a pass boundary (on top of the normal
 // post-shoot pause), between the last shot of one pass and the first shot
 // of the next - they land at the same physical spot with no drive between
 // them, so this is the only thing giving that transition breathing room.
+// Also the only thing bridging a direction flip now - no separate settle/
+// arm-tap/brake sequence, per 2026-08-16 (removed once forward/reverse got
+// their own speed sliders).
 const int DEFAULT_PASS_CHANGE_PAUSE_MS = 1000;
 
 // Balls are constantly rolling in the storage net, so the gate has to open
@@ -109,18 +102,16 @@ const unsigned long FLYWHEEL_SPINUP_MS = 500;  // let flywheels reach speed befo
 
 WebServer server(80);
 
-enum TrainState { T_IDLE, T_SPINUP, T_SHOOT, T_POST_SHOOT, T_PASS_PAUSE, T_DRIVE, T_BRAKE, T_POST_DRIVE, T_DIR_SETTLE, T_DIR_ARM, T_DIR_RELEASE, T_TEST_DRIVE, T_TEST_BRAKE, T_TEST_PAUSE };
+enum TrainState { T_IDLE, T_SPINUP, T_SHOOT, T_POST_SHOOT, T_PASS_PAUSE, T_DRIVE, T_POST_DRIVE, T_TEST_DRIVE, T_TEST_PAUSE };
 TrainState trainState = T_IDLE;
 
 int totalBalls        = DEFAULT_BALL_COUNT;
 int shotsPerLeg        = DEFAULT_SHOTS_PER_LEG;
 int flywheelPct        = DEFAULT_FLYWHEEL_PCT;
-int drivePct           = DEFAULT_DRIVE_PCT;
+int forwardPct         = DEFAULT_FORWARD_PCT;
+int reversePct         = DEFAULT_REVERSE_PCT;
 int traverseMs         = DEFAULT_TRAVERSE_MS;
 int postDrivePauseMs    = DEFAULT_POST_DRIVE_PAUSE_MS;
-int dirSettleMs         = DEFAULT_DIR_SETTLE_MS;
-int dirArmMs            = DEFAULT_DIR_ARM_MS;
-int brakeMs             = DEFAULT_BRAKE_MS;
 int passChangePauseMs   = DEFAULT_PASS_CHANGE_PAUSE_MS;
 // 0 = both flywheels equal, 1 = "spin right" (right motor full, left motor
 // 50 points slower), -1 = "spin left" (mirrored). Which physical direction
@@ -132,7 +123,6 @@ int shotIndex   = 0;   // total shots fired so far, 0-based
 int legShotCount = 0;  // shots fired within the current pass, resets at each leg boundary
 int direction   = 1;   // 1 = forward, -1 = reverse, flips once a full pass completes
 bool driveEndsLeg = false;  // set when the upcoming drive segment is the one that completes the pass (only true for balls-per-pass == 1)
-bool directionJustFlipped = false;  // consumed by the next drive segment to decide whether it needs the neutral settle first
 int testSegmentsRemaining = 0;  // counts down during a traverse test, mirrors a real leg's segment count
 unsigned long phaseStart = 0;
 
@@ -171,6 +161,14 @@ void setFlywheels() {
   setPulse(CH_RIGHT, map(rightPct, 0, 100, MIN_US, MAX_US));
 }
 
+// Forward and reverse use separate speed sliders (see FORWARD/REVERSE_PCT
+// above) since reverse runs much faster than forward at the same percent
+// on this ESC - this picks the right one for whichever direction dir is.
+int drivePulseFor(int dir) {
+  int pct = (dir > 0) ? forwardPct : reversePct;
+  return DRIVE_NEUTRAL_US + (long)dir * pct * DRIVE_MAX_DELTA_US / 100;
+}
+
 void stopTrain() {
   trainState = T_IDLE;
   armed = false;
@@ -188,7 +186,7 @@ void beginShoot() {
 int testDirection = 1;  // 1 = forward, -1 = reverse - which way the Traverse Test drives
 
 void beginTestSegment() {
-  int us = DRIVE_NEUTRAL_US + (long)testDirection * drivePct * DRIVE_MAX_DELTA_US / 100;
+  int us = drivePulseFor(testDirection);
   setPulse(CH_DRIVE, us);
   trainState = T_TEST_DRIVE;
   phaseStart = millis();
@@ -250,23 +248,14 @@ void advanceTrain() {
           // breathing room this transition gets).
           direction = -direction;
           legShotCount = 0;
-          directionJustFlipped = true;
           Serial.println("Pass complete - reversing direction");
           trainState = T_PASS_PAUSE;
-          phaseStart = millis();
-        } else if (directionJustFlipped) {
-          // First drive segment since a direction flip - hold neutral
-          // explicitly before reversing, see DEFAULT_DIR_SETTLE_MS.
-          driveEndsLeg = passComplete;
-          directionJustFlipped = false;
-          setPulse(CH_DRIVE, DRIVE_NEUTRAL_US);
-          trainState = T_DIR_SETTLE;
           phaseStart = millis();
         } else {
           // Either more shots remain in this pass, or (balls-per-pass == 1)
           // this is the single trailing drive that completes the pass.
           driveEndsLeg = passComplete;
-          int us = DRIVE_NEUTRAL_US + (long)direction * drivePct * DRIVE_MAX_DELTA_US / 100;
+          int us = drivePulseFor(direction);
           setPulse(CH_DRIVE, us);
           trainState = T_DRIVE;
           phaseStart = millis();
@@ -283,58 +272,11 @@ void advanceTrain() {
       }
       break;
 
-    case T_DIR_SETTLE:
-      if (elapsed >= (unsigned long)dirSettleMs) {
-        // Arm-tap: this reverse pulse is expected to be read as a brake,
-        // not real motion, since the ESC's last direction was forward.
-        int us = DRIVE_NEUTRAL_US + (long)direction * drivePct * DRIVE_MAX_DELTA_US / 100;
-        setPulse(CH_DRIVE, us);
-        trainState = T_DIR_ARM;
-        phaseStart = millis();
-        Serial.print("Arm-tap pulse: "); Serial.print(us); Serial.println("us");
-      }
-      break;
-
-    case T_DIR_ARM:
-      if (elapsed >= (unsigned long)dirArmMs) {
-        setPulse(CH_DRIVE, DRIVE_NEUTRAL_US);
-        trainState = T_DIR_RELEASE;
-        phaseStart = millis();
-      }
-      break;
-
-    case T_DIR_RELEASE:
-      if (elapsed >= (unsigned long)dirSettleMs) {
-        // Second reverse command - this is the one that should actually
-        // drive backward, now that reverse is armed.
-        int us = DRIVE_NEUTRAL_US + (long)direction * drivePct * DRIVE_MAX_DELTA_US / 100;
-        setPulse(CH_DRIVE, us);
-        trainState = T_DRIVE;
-        phaseStart = millis();
-        Serial.print("Drive segment start: dir="); Serial.print(direction);
-        Serial.print(" pulse="); Serial.print(us);
-        Serial.print("us target="); Serial.print(segmentDriveMs()); Serial.println("ms");
-      }
-      break;
-
     case T_DRIVE:
       if (elapsed >= (unsigned long)segmentDriveMs()) {
-        // Active brake instead of coasting to a stop - see DEFAULT_BRAKE_MS.
-        int brakeUs = DRIVE_NEUTRAL_US + (long)(-direction) * drivePct * DRIVE_MAX_DELTA_US / 100;
-        setPulse(CH_DRIVE, brakeUs);
-        trainState = T_BRAKE;
-        phaseStart = millis();
-        Serial.print("Drive segment done, elapsed="); Serial.print(elapsed);
-        Serial.print("ms, braking with "); Serial.print(brakeUs); Serial.println("us");
-      }
-      break;
-
-    case T_BRAKE:
-      if (elapsed >= (unsigned long)brakeMs) {
         setPulse(CH_DRIVE, DRIVE_NEUTRAL_US);
         trainState = T_POST_DRIVE;
         phaseStart = millis();
-        Serial.println("Brake done, drive channel neutral");
       }
       break;
 
@@ -346,7 +288,6 @@ void advanceTrain() {
           direction = -direction;
           legShotCount = 0;
           driveEndsLeg = false;
-          directionJustFlipped = true;
           Serial.println("Pass complete - reversing direction");
         }
         beginShoot();
@@ -360,19 +301,8 @@ void advanceTrain() {
       // dead stop cover noticeably less distance per second of drive time
       // than one continuous run at the same total time - a continuous test
       // would calibrate a Traverse Time that then falls short in the real,
-      // segmented run. Brakes the same way a real segment does (see
-      // T_BRAKE) so the test's total travel actually matches what the real
-      // run will cover, coast-out included.
+      // segmented run.
       if (elapsed >= (unsigned long)segmentDriveMs()) {
-        int brakeUs = DRIVE_NEUTRAL_US + (long)(-testDirection) * drivePct * DRIVE_MAX_DELTA_US / 100;
-        setPulse(CH_DRIVE, brakeUs);
-        trainState = T_TEST_BRAKE;
-        phaseStart = millis();
-      }
-      break;
-
-    case T_TEST_BRAKE:
-      if (elapsed >= (unsigned long)brakeMs) {
         setPulse(CH_DRIVE, DRIVE_NEUTRAL_US);
         testSegmentsRemaining--;
         if (testSegmentsRemaining <= 0) {
@@ -590,10 +520,18 @@ const char* PAGE_HTML = R"rawliteral(
 
     <div class="field">
       <div class="field-row">
-        <div class="field-label"><svg viewBox="0 0 18 18" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M2 9h14"/><path d="M12 5l4 4-4 4"/><path d="M6 5 2 9l4 4"/></svg><label>Drive power</label></div>
-        <span class="val" id="driveVal">60%</span>
+        <div class="field-label"><svg viewBox="0 0 18 18" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M2 9h14"/><path d="M12 5l4 4-4 4"/></svg><label>Forward speed</label></div>
+        <span class="val" id="fwdVal">60%</span>
       </div>
-      <input type="range" id="drive" min="0" max="100" value="60">
+      <input type="range" id="fwdspeed" min="40" max="100" value="60">
+    </div>
+
+    <div class="field">
+      <div class="field-row">
+        <div class="field-label"><svg viewBox="0 0 18 18" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M6 5 2 9l4 4"/></svg><label>Reverse speed</label></div>
+        <span class="val" id="revVal">30%</span>
+      </div>
+      <input type="range" id="revspeed" min="30" max="100" value="30">
     </div>
 
     <div class="field">
@@ -613,12 +551,10 @@ const char* PAGE_HTML = R"rawliteral(
           <svg viewBox="0 0 18 18" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M2 9h14"/><path d="M12 5l4 4-4 4"/></svg>
           <label>Traverse test</label>
         </div>
-        <div class="hint" style="margin-top:0;">Runs the same number of stop-start segments as "balls per pass," at the Drive Power and Traverse Time set above - no gate, no flywheels. This matches the real run's repeated-stop behavior, so it may cover less distance than one continuous drive would. Watch how far it actually goes, adjust the two sliders above, run it again - once it covers the real net length you're calibrated, and every shot uses that same speed and time to work out where it is.</div>
-        <div class="spin-row" style="margin-top:10px;">
+        <div class="spin-row" style="margin-top:6px;">
           <button type="button" class="spin-opt dir-opt selected" data-dir="1" onclick="setTestDir(1,this)">Forward</button>
           <button type="button" class="spin-opt dir-opt" data-dir="-1" onclick="setTestDir(-1,this)">Reverse</button>
         </div>
-        <div class="hint">Test reverse specifically if forward and reverse feel different at the same settings - some ESCs respond very differently to the same commanded power depending on direction.</div>
         <button id="testDriveBtn" type="button" onclick="testDrive()" style="width:100%; margin-top:10px; background:var(--surface); color:var(--green); border:1.5px solid var(--green);">RUN TRAVERSE TEST</button>
       </div>
 
@@ -628,34 +564,6 @@ const char* PAGE_HTML = R"rawliteral(
           <span class="val" id="pdriveVal">500ms</span>
         </div>
         <input type="range" id="pdrive" min="100" max="5000" step="50" value="500">
-        <div class="hint">Lets the buggy come to a full stop before the next gate opens.</div>
-      </div>
-
-      <div class="field">
-        <div class="field-row">
-          <div class="field-label"><svg viewBox="0 0 18 18" fill="none" stroke="currentColor" stroke-width="1.6"><circle cx="9" cy="9" r="6.5"/><path d="M9 5.5V9l3 2"/></svg><label>Brake pulse</label></div>
-          <span class="val" id="brakeVal">200ms</span>
-        </div>
-        <input type="range" id="brake" min="0" max="800" step="25" value="200">
-        <div class="hint">Opposite-direction pulse at the end of every drive segment, instead of just cutting to neutral and coasting. Set to 0 to disable if it turns out too aggressive.</div>
-      </div>
-
-      <div class="field">
-        <div class="field-row">
-          <div class="field-label"><svg viewBox="0 0 18 18" fill="none" stroke="currentColor" stroke-width="1.6"><circle cx="9" cy="9" r="6.5"/><path d="M9 5.5V9l3 2"/></svg><label>Direction settle</label></div>
-          <span class="val" id="dirsettleVal">500ms</span>
-        </div>
-        <input type="range" id="dirsettle" min="100" max="3000" step="50" value="500">
-        <div class="hint">Neutral hold on both sides of the arm-tap below.</div>
-      </div>
-
-      <div class="field" style="margin-bottom:0;">
-        <div class="field-row">
-          <div class="field-label"><svg viewBox="0 0 18 18" fill="none" stroke="currentColor" stroke-width="1.6"><circle cx="9" cy="9" r="6.5"/><path d="M9 5.5V9l3 2"/></svg><label>Direction arm-tap</label></div>
-          <span class="val" id="dirarmVal">300ms</span>
-        </div>
-        <input type="range" id="dirarm" min="100" max="1500" step="50" value="300">
-        <div class="hint">Brief reverse pulse before the real one, on a direction flip - the ESC likely reads the first reverse command after forward as a brake, this taps it so the second one actually drives.</div>
       </div>
 
       <div class="field" style="margin-bottom:0;">
@@ -664,7 +572,6 @@ const char* PAGE_HTML = R"rawliteral(
           <span class="val" id="passpauseVal">1000ms</span>
         </div>
         <input type="range" id="passpause" min="200" max="3000" step="50" value="1000">
-        <div class="hint">Extra pause between the last shot of a pass and the first shot of the next - they land at the same spot with no drive between them.</div>
       </div>
     </div>
   </details>
@@ -680,7 +587,7 @@ let heartbeatTimer = null;
 let pollTimer = null;
 let running = false;
 let spinMode = 0;
-const PARAM_IDS = ['balls','perleg','fw','drive','traverse','pdrive','brake','dirsettle','dirarm','passpause'];
+const PARAM_IDS = ['balls','perleg','fw','fwdspeed','revspeed','traverse','pdrive','passpause'];
 const BUTTON_IDS = ['startBtn','testDriveBtn'];
 
 function startHeartbeat() {
@@ -724,10 +631,11 @@ function startTrain() {
 }
 
 function testDrive() {
-  const drive = document.getElementById('drive').value;
+  const fwdspeed = document.getElementById('fwdspeed').value;
+  const revspeed = document.getElementById('revspeed').value;
   const traverse = document.getElementById('traverse').value;
   const perleg = document.getElementById('perleg').value;
-  beginRun(`/testdrive?drive=${drive}&traverse=${traverse}&perleg=${perleg}&dir=${testDirection}`);
+  beginRun(`/testdrive?fwdspeed=${fwdspeed}&revspeed=${revspeed}&traverse=${traverse}&perleg=${perleg}&dir=${testDirection}`);
 }
 
 function stopTrain() {
@@ -740,8 +648,8 @@ function stopTrain() {
 
 const FWD_ARROW = '<path d="M2 9h13"/><path d="M11 5l4 4-4 4"/>';
 const REV_ARROW = '<path d="M16 9H3"/><path d="M7 5 3 9l4 4"/>';
-const ACTIVE_STATES = ['shoot', 'drive', 'brake', 'dirarm', 'testdrive'];
-const STATUS_LABELS = { spinup: 'SPINNING UP', shoot: 'FIRING', postshoot: 'COOLDOWN', passpause: 'PASS CHANGE', drive: 'DRIVING', brake: 'BRAKING', postdrive: 'COOLDOWN', dirsettle: 'SETTLING', dirarm: 'ARMING', testdrive: 'TEST DRIVE' };
+const ACTIVE_STATES = ['shoot', 'drive', 'testdrive'];
+const STATUS_LABELS = { spinup: 'SPINNING UP', shoot: 'FIRING', postshoot: 'COOLDOWN', passpause: 'PASS CHANGE', drive: 'DRIVING', postdrive: 'COOLDOWN', testdrive: 'TEST DRIVE' };
 
 function pollStatus() {
   fetch('/trainstatus').then(r => r.json()).then(s => {
@@ -779,12 +687,10 @@ function pollStatus() {
 }
 
 document.getElementById('fw').addEventListener('input', function() { document.getElementById('fwVal').textContent = this.value + '%'; });
-document.getElementById('drive').addEventListener('input', function() { document.getElementById('driveVal').textContent = this.value + '%'; });
+document.getElementById('fwdspeed').addEventListener('input', function() { document.getElementById('fwdVal').textContent = this.value + '%'; });
+document.getElementById('revspeed').addEventListener('input', function() { document.getElementById('revVal').textContent = this.value + '%'; });
 document.getElementById('traverse').addEventListener('input', function() { document.getElementById('traverseVal').textContent = (this.value / 1000).toFixed(1) + 's'; });
 document.getElementById('pdrive').addEventListener('input', function() { document.getElementById('pdriveVal').textContent = this.value + 'ms'; });
-document.getElementById('dirsettle').addEventListener('input', function() { document.getElementById('dirsettleVal').textContent = this.value + 'ms'; });
-document.getElementById('dirarm').addEventListener('input', function() { document.getElementById('dirarmVal').textContent = this.value + 'ms'; });
-document.getElementById('brake').addEventListener('input', function() { document.getElementById('brakeVal').textContent = this.value + 'ms'; });
 document.getElementById('passpause').addEventListener('input', function() { document.getElementById('passpauseVal').textContent = this.value + 'ms'; });
 
 pollTimer = setInterval(pollStatus, 300);
@@ -801,12 +707,10 @@ void handleTrainStart() {
   if (server.hasArg("balls"))    totalBalls       = constrain(server.arg("balls").toInt(), 1, 100);
   if (server.hasArg("perleg"))   shotsPerLeg      = constrain(server.arg("perleg").toInt(), 1, 50);
   if (server.hasArg("fw"))       flywheelPct      = constrain(server.arg("fw").toInt(), 0, 100);
-  if (server.hasArg("drive"))    drivePct         = constrain(server.arg("drive").toInt(), 0, 100);
+  if (server.hasArg("fwdspeed")) forwardPct       = constrain(server.arg("fwdspeed").toInt(), FORWARD_MIN_PCT, 100);
+  if (server.hasArg("revspeed")) reversePct       = constrain(server.arg("revspeed").toInt(), REVERSE_MIN_PCT, 100);
   if (server.hasArg("traverse")) traverseMs       = constrain(server.arg("traverse").toInt(), 200, 15000);
   if (server.hasArg("pdrive"))   postDrivePauseMs = constrain(server.arg("pdrive").toInt(), 50, 5000);
-  if (server.hasArg("dirsettle")) dirSettleMs     = constrain(server.arg("dirsettle").toInt(), 100, 3000);
-  if (server.hasArg("dirarm"))    dirArmMs        = constrain(server.arg("dirarm").toInt(), 100, 1500);
-  if (server.hasArg("brake"))     brakeMs         = constrain(server.arg("brake").toInt(), 0, 800);
   if (server.hasArg("passpause")) passChangePauseMs = constrain(server.arg("passpause").toInt(), 100, 5000);
   if (server.hasArg("spin"))     spinMode         = constrain(server.arg("spin").toInt(), -1, 1);
 
@@ -814,7 +718,6 @@ void handleTrainStart() {
   legShotCount = 0;
   direction = 1;
   driveEndsLeg = false;
-  directionJustFlipped = false;
   armed = true;
   lastHeartbeat = millis();
 
@@ -829,7 +732,8 @@ void handleTrainStart() {
 }
 
 void handleTestDrive() {
-  if (server.hasArg("drive"))    drivePct    = constrain(server.arg("drive").toInt(), 0, 100);
+  if (server.hasArg("fwdspeed")) forwardPct  = constrain(server.arg("fwdspeed").toInt(), FORWARD_MIN_PCT, 100);
+  if (server.hasArg("revspeed")) reversePct  = constrain(server.arg("revspeed").toInt(), REVERSE_MIN_PCT, 100);
   if (server.hasArg("traverse")) traverseMs  = constrain(server.arg("traverse").toInt(), 200, 15000);
   if (server.hasArg("perleg"))   shotsPerLeg = constrain(server.arg("perleg").toInt(), 1, 50);
   if (server.hasArg("dir"))      testDirection = (server.arg("dir").toInt() < 0) ? -1 : 1;
@@ -858,20 +762,15 @@ void handleTrainStatus() {
     case T_SHOOT:      stateStr = "shoot";      break;
     case T_POST_SHOOT: stateStr = "postshoot";  break;
     case T_PASS_PAUSE: stateStr = "passpause";  break;
-    case T_DRIVE:       stateStr = "drive";      break;
-    case T_BRAKE:       stateStr = "brake";      break;
-    case T_POST_DRIVE:  stateStr = "postdrive";  break;
-    case T_DIR_SETTLE:  stateStr = "dirsettle";  break;
-    case T_DIR_ARM:     stateStr = "dirarm";     break;
-    case T_DIR_RELEASE: stateStr = "dirsettle";  break;
+    case T_DRIVE:      stateStr = "drive";      break;
+    case T_POST_DRIVE: stateStr = "postdrive";  break;
     case T_TEST_DRIVE:
-    case T_TEST_BRAKE:
     case T_TEST_PAUSE: stateStr = "testdrive";  break;
     default:           stateStr = "idle";       break;
   }
   // Test actions don't touch the ball sequence at all - report 0/0 rather
   // than whatever's left over from the last real run.
-  bool isTest = (trainState == T_TEST_DRIVE || trainState == T_TEST_BRAKE || trainState == T_TEST_PAUSE);
+  bool isTest = (trainState == T_TEST_DRIVE || trainState == T_TEST_PAUSE);
   int ballDisplay = (trainState == T_IDLE || isTest) ? 0 : (shotIndex + 1);
   int totalDisplay = isTest ? 0 : totalBalls;
   String json = String("{\"state\":\"") + stateStr + "\",\"ball\":" + String(ballDisplay) +
