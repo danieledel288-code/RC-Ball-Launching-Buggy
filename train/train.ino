@@ -528,6 +528,7 @@ const char* PAGE_HTML = R"rawliteral(
     <div>
       <h1>Train Mode</h1>
       <p class="subtitle">RC Ball-Launching Buggy</p>
+      <p class="subtitle">Made by Daniel Edelstein with Blueprint.io</p>
     </div>
     <div id="statusBadge" class="status idle"><span class="dot"></span>IDLE</div>
   </div>
@@ -560,7 +561,6 @@ const char* PAGE_HTML = R"rawliteral(
         <input type="number" id="perleg" min="1" max="50" value="4">
       </div>
     </div>
-    <div class="hint">Balls per pass = shots across one direction, including both ends - 2 means one at each end of the net. Set it equal to "balls to fire" for a single one-way run.</div>
   </div>
 
   <div class="card">
@@ -570,7 +570,7 @@ const char* PAGE_HTML = R"rawliteral(
         <span class="val" id="fwVal">75%</span>
       </div>
       <input type="range" id="fw" min="0" max="100" value="75">
-      <div class="spin-row">
+      <div class="spin-row" style="margin-bottom:16px;">
         <button type="button" class="spin-opt selected" data-spin="0" onclick="setSpin(0,this)">Straight</button>
         <button type="button" class="spin-opt" data-spin="1" onclick="setSpin(1,this)">Spin right</button>
         <button type="button" class="spin-opt" data-spin="-1" onclick="setSpin(-1,this)">Spin left</button>
