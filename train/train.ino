@@ -83,7 +83,7 @@ const unsigned long FLYWHEEL_SPINUP_MS = 500;  // let flywheels reach speed befo
 
 WebServer server(80);
 
-enum TrainState { T_IDLE, T_SPINUP, T_SHOOT, T_POST_SHOOT, T_DRIVE, T_POST_DRIVE, T_TEST_DRIVE, T_TEST_PAUSE, T_SPIN_TEST };
+enum TrainState { T_IDLE, T_SPINUP, T_SHOOT, T_POST_SHOOT, T_DRIVE, T_POST_DRIVE, T_TEST_DRIVE, T_TEST_PAUSE, T_FLY_TEST };
 TrainState trainState = T_IDLE;
 
 int totalBalls        = DEFAULT_BALL_COUNT;
@@ -92,6 +92,11 @@ int flywheelPct        = DEFAULT_FLYWHEEL_PCT;
 int drivePct           = DEFAULT_DRIVE_PCT;
 int traverseMs         = DEFAULT_TRAVERSE_MS;
 int postDrivePauseMs    = DEFAULT_POST_DRIVE_PAUSE_MS;
+// 0 = both flywheels equal, 1 = "spin right" (right motor full, left motor
+// 50 points slower), -1 = "spin left" (mirrored). Which physical direction
+// the ball actually curves toward is unverified - test both and see, flip
+// setFlywheels() below if it's backwards from the button label.
+int spinMode = 0;
 
 int shotIndex   = 0;   // total shots fired so far, 0-based
 int legShotCount = 0;  // shots fired within the current pass, resets at each leg boundary
@@ -118,6 +123,21 @@ void allNeutral() {
   setPulse(CH_RIGHT, MIN_US);
   setPulse(CH_DRIVE, DRIVE_NEUTRAL_US);
   setServoAngle(CH_SERVO, GATE_CLOSED_ANGLE);
+}
+
+// Applies flywheelPct to both motors, or a 50-point differential between
+// them if spinMode is set, to put spin on the ball.
+void setFlywheels() {
+  int slowPct = flywheelPct - 50;
+  if (slowPct < 0) slowPct = 0;
+
+  int leftPct  = flywheelPct;
+  int rightPct = flywheelPct;
+  if (spinMode > 0)      { leftPct = slowPct; }       // spin right: right motor full, left slower
+  else if (spinMode < 0) { rightPct = slowPct; }       // spin left: left motor full, right slower
+
+  setPulse(CH_LEFT,  map(leftPct,  0, 100, MIN_US, MAX_US));
+  setPulse(CH_RIGHT, map(rightPct, 0, 100, MIN_US, MAX_US));
 }
 
 void stopTrain() {
@@ -259,7 +279,7 @@ void advanceTrain() {
       }
       break;
 
-    case T_SPIN_TEST:
+    case T_FLY_TEST:
       // Flywheels-only, indefinite - nothing to advance here. Ends via the
       // STOP button (handleTrainStop) or the heartbeat watchdog, not a timer.
       break;
@@ -373,6 +393,16 @@ const char* PAGE_HTML = R"rawliteral(
 
   .two-col { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin-bottom: 14px; }
 
+  .spin-row { display: flex; gap: 8px; margin-bottom: 4px; }
+  .spin-opt {
+    flex: 1; padding: 10px 4px; font-size: 12.5px; font-weight: 700; letter-spacing: 0;
+    border-radius: 999px; border: 1.5px solid var(--border); background: var(--surface);
+    color: var(--ink-soft); cursor: pointer; transition: transform 0.1s ease-out;
+  }
+  .spin-opt.selected { background: var(--green); color: #ffffff; border-color: var(--green); }
+  .spin-opt:disabled { background: var(--surface); color: var(--border); border-color: var(--border); cursor: default; }
+  .spin-opt:active:not(:disabled) { transform: scale(0.96); }
+
   details.card summary {
     list-style: none; cursor: pointer; display: flex; align-items: center;
     justify-content: space-between; font-size: 13px; font-weight: 700; color: var(--ink-soft);
@@ -441,6 +471,12 @@ const char* PAGE_HTML = R"rawliteral(
         <span class="val" id="fwVal">75%</span>
       </div>
       <input type="range" id="fw" min="0" max="100" value="75">
+      <div class="spin-row">
+        <button type="button" class="spin-opt selected" data-spin="0" onclick="setSpin(0,this)">Straight</button>
+        <button type="button" class="spin-opt" data-spin="1" onclick="setSpin(1,this)">Spin right</button>
+        <button type="button" class="spin-opt" data-spin="-1" onclick="setSpin(-1,this)">Spin left</button>
+      </div>
+      <div class="hint">Spin runs one flywheel 50 points slower than the other to curve the ball. Which button curves which way is untested - try both.</div>
     </div>
 
     <div class="field">
@@ -476,10 +512,10 @@ const char* PAGE_HTML = R"rawliteral(
       <div class="field" style="padding-bottom:14px; margin-bottom:14px; border-bottom:1px solid var(--border);">
         <div class="field-label" style="margin-bottom:8px;">
           <svg viewBox="0 0 18 18" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"><path d="M3 13a6 6 0 0 1 12 0"/><path d="M9 13 12 8"/></svg>
-          <label>Spin test</label>
+          <label>Flywheel test</label>
         </div>
-        <div class="hint" style="margin-top:0;">Spins the flywheels at the Flywheel Power set above, nothing else touched. Runs until you hit STOP - useful for checking speed and balance without loading a ball.</div>
-        <button id="spinBtn" type="button" onclick="spinTest()" style="width:100%; margin-top:10px; background:var(--surface); color:var(--green); border:1.5px solid var(--green);">SPIN FLYWHEELS</button>
+        <div class="hint" style="margin-top:0;">Spins the flywheels at the Flywheel Power and Spin setting above, nothing else touched. Runs until you hit STOP - useful for checking speed, balance, and which way spin actually curves, without loading a ball.</div>
+        <button id="flyBtn" type="button" onclick="flywheelTest()" style="width:100%; margin-top:10px; background:var(--surface); color:var(--green); border:1.5px solid var(--green);">RUN FLYWHEEL TEST</button>
       </div>
 
       <div class="field" style="margin-bottom:0;">
@@ -503,8 +539,9 @@ const char* PAGE_HTML = R"rawliteral(
 let heartbeatTimer = null;
 let pollTimer = null;
 let running = false;
+let spinMode = 0;
 const PARAM_IDS = ['balls','perleg','fw','drive','traverse','pdrive'];
-const BUTTON_IDS = ['startBtn','testDriveBtn','spinBtn'];
+const BUTTON_IDS = ['startBtn','testDriveBtn','flyBtn'];
 
 function startHeartbeat() {
   if (heartbeatTimer) return;
@@ -517,6 +554,13 @@ function stopHeartbeat() {
 
 function setConfigEnabled(enabled) {
   PARAM_IDS.concat(BUTTON_IDS).forEach(id => { document.getElementById(id).disabled = !enabled; });
+  document.querySelectorAll('.spin-opt').forEach(btn => { btn.disabled = !enabled; });
+}
+
+function setSpin(val, btn) {
+  spinMode = val;
+  document.querySelectorAll('.spin-opt').forEach(b => b.classList.remove('selected'));
+  btn.classList.add('selected');
 }
 
 function beginRun(url) {
@@ -529,7 +573,7 @@ function beginRun(url) {
 
 function startTrain() {
   const params = PARAM_IDS.map(id => `${id}=${document.getElementById(id).value}`).join('&');
-  beginRun(`/trainstart?${params}`);
+  beginRun(`/trainstart?${params}&spin=${spinMode}`);
 }
 
 function testDrive() {
@@ -539,9 +583,9 @@ function testDrive() {
   beginRun(`/testdrive?drive=${drive}&traverse=${traverse}&perleg=${perleg}`);
 }
 
-function spinTest() {
+function flywheelTest() {
   const fw = document.getElementById('fw').value;
-  beginRun(`/spintest?fw=${fw}`);
+  beginRun(`/flywheeltest?fw=${fw}&spin=${spinMode}`);
 }
 
 function stopTrain() {
@@ -554,8 +598,8 @@ function stopTrain() {
 
 const FWD_ARROW = '<path d="M2 9h13"/><path d="M11 5l4 4-4 4"/>';
 const REV_ARROW = '<path d="M16 9H3"/><path d="M7 5 3 9l4 4"/>';
-const ACTIVE_STATES = ['shoot', 'drive', 'testdrive', 'spintest'];
-const STATUS_LABELS = { spinup: 'SPINNING UP', shoot: 'FIRING', postshoot: 'COOLDOWN', drive: 'DRIVING', postdrive: 'COOLDOWN', testdrive: 'TEST DRIVE', spintest: 'SPIN TEST' };
+const ACTIVE_STATES = ['shoot', 'drive', 'testdrive', 'flytest'];
+const STATUS_LABELS = { spinup: 'SPINNING UP', shoot: 'FIRING', postshoot: 'COOLDOWN', drive: 'DRIVING', postdrive: 'COOLDOWN', testdrive: 'TEST DRIVE', flytest: 'FLY TEST' };
 
 function pollStatus() {
   fetch('/trainstatus').then(r => r.json()).then(s => {
@@ -614,6 +658,7 @@ void handleTrainStart() {
   if (server.hasArg("drive"))    drivePct         = constrain(server.arg("drive").toInt(), 0, 100);
   if (server.hasArg("traverse")) traverseMs       = constrain(server.arg("traverse").toInt(), 200, 15000);
   if (server.hasArg("pdrive"))   postDrivePauseMs = constrain(server.arg("pdrive").toInt(), 50, 5000);
+  if (server.hasArg("spin"))     spinMode         = constrain(server.arg("spin").toInt(), -1, 1);
 
   shotIndex = 0;
   legShotCount = 0;
@@ -623,8 +668,7 @@ void handleTrainStart() {
 
   setServoAngle(CH_SERVO, GATE_CLOSED_ANGLE);
   setPulse(CH_DRIVE, DRIVE_NEUTRAL_US);
-  setPulse(CH_LEFT,  map(flywheelPct, 0, 100, MIN_US, MAX_US));
-  setPulse(CH_RIGHT, map(flywheelPct, 0, 100, MIN_US, MAX_US));
+  setFlywheels();
 
   trainState = T_SPINUP;
   phaseStart = millis();
@@ -647,16 +691,17 @@ void handleTestDrive() {
   server.send(200, "text/plain", "testing");
 }
 
-void handleSpinTest() {
-  if (server.hasArg("fw")) flywheelPct = constrain(server.arg("fw").toInt(), 0, 100);
+void handleFlywheelTest() {
+  if (server.hasArg("fw"))   flywheelPct = constrain(server.arg("fw").toInt(), 0, 100);
+  if (server.hasArg("spin")) spinMode    = constrain(server.arg("spin").toInt(), -1, 1);
 
   armed = true;
   lastHeartbeat = millis();
-  setPulse(CH_LEFT,  map(flywheelPct, 0, 100, MIN_US, MAX_US));
-  setPulse(CH_RIGHT, map(flywheelPct, 0, 100, MIN_US, MAX_US));
-  trainState = T_SPIN_TEST;
+  setFlywheels();
+  trainState = T_FLY_TEST;
   phaseStart = millis();
-  Serial.print("Spin test started at "); Serial.print(flywheelPct); Serial.println("%");
+  Serial.print("Flywheel test started at "); Serial.print(flywheelPct);
+  Serial.print("%, spin="); Serial.println(spinMode);
   server.send(200, "text/plain", "spinning");
 }
 
@@ -677,12 +722,12 @@ void handleTrainStatus() {
     case T_POST_DRIVE: stateStr = "postdrive";  break;
     case T_TEST_DRIVE:
     case T_TEST_PAUSE: stateStr = "testdrive";  break;
-    case T_SPIN_TEST:  stateStr = "spintest";   break;
+    case T_FLY_TEST:   stateStr = "flytest";    break;
     default:           stateStr = "idle";       break;
   }
   // Test actions don't touch the ball sequence at all - report 0/0 rather
   // than whatever's left over from the last real run.
-  bool isTest = (trainState == T_TEST_DRIVE || trainState == T_TEST_PAUSE || trainState == T_SPIN_TEST);
+  bool isTest = (trainState == T_TEST_DRIVE || trainState == T_TEST_PAUSE || trainState == T_FLY_TEST);
   int ballDisplay = (trainState == T_IDLE || isTest) ? 0 : (shotIndex + 1);
   int totalDisplay = isTest ? 0 : totalBalls;
   String json = String("{\"state\":\"") + stateStr + "\",\"ball\":" + String(ballDisplay) +
@@ -714,7 +759,7 @@ void setup() {
   server.on("/", handleRoot);
   server.on("/trainstart", handleTrainStart);
   server.on("/testdrive", handleTestDrive);
-  server.on("/spintest", handleSpinTest);
+  server.on("/flywheeltest", handleFlywheelTest);
   server.on("/trainstop", handleTrainStop);
   server.on("/trainstatus", handleTrainStatus);
   server.on("/heartbeat", handleHeartbeat);
