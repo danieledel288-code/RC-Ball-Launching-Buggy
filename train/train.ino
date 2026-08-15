@@ -73,14 +73,17 @@ const int POST_SHOOT_PAUSE_MS = 300;  // gate finishes closing before the drive 
 // --- Advanced defaults - tucked under the Advanced Settings disclosure ---
 const int DEFAULT_POST_DRIVE_PAUSE_MS  = 500;  // buggy comes to a full stop before the next gate opens
 
-// Working theory from a real field test (2026-08-15): the QuicRun 1060
-// didn't reverse for the pass-2 return leg, plausibly because bidirectional
-// ESCs commonly treat a reverse command arriving right after forward as a
-// brake pulse rather than an actual reverse, unless the signal explicitly
-// holds at neutral for a moment first. This is that explicit hold,
-// inserted only on the first drive segment after a direction flip - not
-// confirmed against the QuicRun 1060 datasheet, tune if it's still wrong.
+// Real field test (2026-08-15) found the buggy still wasn't reversing even
+// after a plain neutral hold before the reverse pulse. Revised theory: many
+// bidirectional car ESCs (QuicRun 1060 likely included, not confirmed
+// against its datasheet) use a double-tap to arm reverse - the first
+// reverse command after forward motion is read as a brake, not a real
+// reverse, and only a SECOND reverse command (with a neutral gap in
+// between) actually drives backward. So the full sequence on a direction
+// flip is now: neutral hold -> brief reverse "tap" (eaten as brake/arm) ->
+// neutral again -> real reverse pulse (this is what starts driving).
 const int DEFAULT_DIR_SETTLE_MS = 500;
+const int DEFAULT_DIR_ARM_MS    = 300;  // duration of the arm-tap reverse pulse
 
 // Extra pause specifically at a pass boundary (on top of the normal
 // post-shoot pause), between the last shot of one pass and the first shot
@@ -98,7 +101,7 @@ const unsigned long FLYWHEEL_SPINUP_MS = 500;  // let flywheels reach speed befo
 
 WebServer server(80);
 
-enum TrainState { T_IDLE, T_SPINUP, T_SHOOT, T_POST_SHOOT, T_PASS_PAUSE, T_DRIVE, T_POST_DRIVE, T_DIR_SETTLE, T_TEST_DRIVE, T_TEST_PAUSE };
+enum TrainState { T_IDLE, T_SPINUP, T_SHOOT, T_POST_SHOOT, T_PASS_PAUSE, T_DRIVE, T_POST_DRIVE, T_DIR_SETTLE, T_DIR_ARM, T_DIR_RELEASE, T_TEST_DRIVE, T_TEST_PAUSE };
 TrainState trainState = T_IDLE;
 
 int totalBalls        = DEFAULT_BALL_COUNT;
@@ -108,6 +111,7 @@ int drivePct           = DEFAULT_DRIVE_PCT;
 int traverseMs         = DEFAULT_TRAVERSE_MS;
 int postDrivePauseMs    = DEFAULT_POST_DRIVE_PAUSE_MS;
 int dirSettleMs         = DEFAULT_DIR_SETTLE_MS;
+int dirArmMs            = DEFAULT_DIR_ARM_MS;
 int passChangePauseMs   = DEFAULT_PASS_CHANGE_PAUSE_MS;
 // 0 = both flywheels equal, 1 = "spin right" (right motor full, left motor
 // 50 points slower), -1 = "spin left" (mirrored). Which physical direction
@@ -267,6 +271,27 @@ void advanceTrain() {
 
     case T_DIR_SETTLE:
       if (elapsed >= (unsigned long)dirSettleMs) {
+        // Arm-tap: this reverse pulse is expected to be read as a brake,
+        // not real motion, since the ESC's last direction was forward.
+        int us = DRIVE_NEUTRAL_US + (long)direction * drivePct * DRIVE_MAX_DELTA_US / 100;
+        setPulse(CH_DRIVE, us);
+        trainState = T_DIR_ARM;
+        phaseStart = millis();
+      }
+      break;
+
+    case T_DIR_ARM:
+      if (elapsed >= (unsigned long)dirArmMs) {
+        setPulse(CH_DRIVE, DRIVE_NEUTRAL_US);
+        trainState = T_DIR_RELEASE;
+        phaseStart = millis();
+      }
+      break;
+
+    case T_DIR_RELEASE:
+      if (elapsed >= (unsigned long)dirSettleMs) {
+        // Second reverse command - this is the one that should actually
+        // drive backward, now that reverse is armed.
         int us = DRIVE_NEUTRAL_US + (long)direction * drivePct * DRIVE_MAX_DELTA_US / 100;
         setPulse(CH_DRIVE, us);
         trainState = T_DRIVE;
@@ -439,6 +464,7 @@ const char* PAGE_HTML = R"rawliteral(
     flex: 1; padding: 10px 4px; font-size: 12.5px; font-weight: 700; letter-spacing: 0;
     border-radius: 999px; border: 1.5px solid var(--border); background: var(--surface);
     color: var(--ink-soft); cursor: pointer; transition: transform 0.1s ease-out;
+    display: flex; align-items: center; justify-content: center; white-space: nowrap;
   }
   .spin-opt.selected { background: var(--green); color: #ffffff; border-color: var(--green); }
   .spin-opt:disabled { background: var(--surface); color: var(--border); border-color: var(--border); cursor: default; }
@@ -534,7 +560,6 @@ const char* PAGE_HTML = R"rawliteral(
         <span class="val" id="traverseVal">6.0s</span>
       </div>
       <input type="range" id="traverse" min="500" max="8000" step="100" value="6000">
-      <div class="hint">Not measured yet - bench test at this drive power and set this to how long a full end-to-end run actually takes.</div>
     </div>
   </div>
 
@@ -559,13 +584,22 @@ const char* PAGE_HTML = R"rawliteral(
         <div class="hint">Lets the buggy come to a full stop before the next gate opens.</div>
       </div>
 
-      <div class="field" style="margin-bottom:0;">
+      <div class="field">
         <div class="field-row">
           <div class="field-label"><svg viewBox="0 0 18 18" fill="none" stroke="currentColor" stroke-width="1.6"><circle cx="9" cy="9" r="6.5"/><path d="M9 5.5V9l3 2"/></svg><label>Direction settle</label></div>
           <span class="val" id="dirsettleVal">500ms</span>
         </div>
         <input type="range" id="dirsettle" min="100" max="3000" step="50" value="500">
-        <div class="hint">Explicit neutral hold before the first drive segment in a new direction - some ESCs treat a reverse command right after forward as a brake unless it sees neutral first.</div>
+        <div class="hint">Neutral hold on both sides of the arm-tap below.</div>
+      </div>
+
+      <div class="field" style="margin-bottom:0;">
+        <div class="field-row">
+          <div class="field-label"><svg viewBox="0 0 18 18" fill="none" stroke="currentColor" stroke-width="1.6"><circle cx="9" cy="9" r="6.5"/><path d="M9 5.5V9l3 2"/></svg><label>Direction arm-tap</label></div>
+          <span class="val" id="dirarmVal">300ms</span>
+        </div>
+        <input type="range" id="dirarm" min="100" max="1500" step="50" value="300">
+        <div class="hint">Brief reverse pulse before the real one, on a direction flip - the ESC likely reads the first reverse command after forward as a brake, this taps it so the second one actually drives.</div>
       </div>
 
       <div class="field" style="margin-bottom:0;">
@@ -590,7 +624,7 @@ let heartbeatTimer = null;
 let pollTimer = null;
 let running = false;
 let spinMode = 0;
-const PARAM_IDS = ['balls','perleg','fw','drive','traverse','pdrive','dirsettle','passpause'];
+const PARAM_IDS = ['balls','perleg','fw','drive','traverse','pdrive','dirsettle','dirarm','passpause'];
 const BUTTON_IDS = ['startBtn','testDriveBtn'];
 
 function startHeartbeat() {
@@ -643,8 +677,8 @@ function stopTrain() {
 
 const FWD_ARROW = '<path d="M2 9h13"/><path d="M11 5l4 4-4 4"/>';
 const REV_ARROW = '<path d="M16 9H3"/><path d="M7 5 3 9l4 4"/>';
-const ACTIVE_STATES = ['shoot', 'drive', 'testdrive'];
-const STATUS_LABELS = { spinup: 'SPINNING UP', shoot: 'FIRING', postshoot: 'COOLDOWN', passpause: 'PASS CHANGE', drive: 'DRIVING', postdrive: 'COOLDOWN', dirsettle: 'SETTLING', testdrive: 'TEST DRIVE' };
+const ACTIVE_STATES = ['shoot', 'drive', 'dirarm', 'testdrive'];
+const STATUS_LABELS = { spinup: 'SPINNING UP', shoot: 'FIRING', postshoot: 'COOLDOWN', passpause: 'PASS CHANGE', drive: 'DRIVING', postdrive: 'COOLDOWN', dirsettle: 'SETTLING', dirarm: 'ARMING', testdrive: 'TEST DRIVE' };
 
 function pollStatus() {
   fetch('/trainstatus').then(r => r.json()).then(s => {
@@ -686,6 +720,7 @@ document.getElementById('drive').addEventListener('input', function() { document
 document.getElementById('traverse').addEventListener('input', function() { document.getElementById('traverseVal').textContent = (this.value / 1000).toFixed(1) + 's'; });
 document.getElementById('pdrive').addEventListener('input', function() { document.getElementById('pdriveVal').textContent = this.value + 'ms'; });
 document.getElementById('dirsettle').addEventListener('input', function() { document.getElementById('dirsettleVal').textContent = this.value + 'ms'; });
+document.getElementById('dirarm').addEventListener('input', function() { document.getElementById('dirarmVal').textContent = this.value + 'ms'; });
 document.getElementById('passpause').addEventListener('input', function() { document.getElementById('passpauseVal').textContent = this.value + 'ms'; });
 
 pollTimer = setInterval(pollStatus, 300);
@@ -706,6 +741,7 @@ void handleTrainStart() {
   if (server.hasArg("traverse")) traverseMs       = constrain(server.arg("traverse").toInt(), 200, 15000);
   if (server.hasArg("pdrive"))   postDrivePauseMs = constrain(server.arg("pdrive").toInt(), 50, 5000);
   if (server.hasArg("dirsettle")) dirSettleMs     = constrain(server.arg("dirsettle").toInt(), 100, 3000);
+  if (server.hasArg("dirarm"))    dirArmMs        = constrain(server.arg("dirarm").toInt(), 100, 1500);
   if (server.hasArg("passpause")) passChangePauseMs = constrain(server.arg("passpause").toInt(), 100, 5000);
   if (server.hasArg("spin"))     spinMode         = constrain(server.arg("spin").toInt(), -1, 1);
 
@@ -759,6 +795,8 @@ void handleTrainStatus() {
     case T_DRIVE:       stateStr = "drive";      break;
     case T_POST_DRIVE:  stateStr = "postdrive";  break;
     case T_DIR_SETTLE:  stateStr = "dirsettle";  break;
+    case T_DIR_ARM:     stateStr = "dirarm";     break;
+    case T_DIR_RELEASE: stateStr = "dirsettle";  break;
     case T_TEST_DRIVE:
     case T_TEST_PAUSE: stateStr = "testdrive";  break;
     default:           stateStr = "idle";       break;
